@@ -340,6 +340,8 @@ impl Agent {
 
     /// Stream chat response - returns a stream of chunks
     /// After consuming the stream, call `finish_chat_stream` with the full response
+    /// Note: Tool calls during streaming are not yet supported - the model will know
+    /// about tools but any tool_use blocks won't be executed automatically.
     pub async fn chat_stream(&mut self, message: &str) -> Result<StreamResult> {
         // Add user message
         self.session.add_message(Message {
@@ -357,8 +359,11 @@ impl Agent {
         // Build messages for LLM
         let messages = self.session.messages_for_llm();
 
-        // Get stream from provider (no tools for streaming)
-        self.provider.chat_stream(&messages, None).await
+        // Get tool schemas so the model knows the correct tool call format
+        let tool_schemas: Vec<ToolSchema> = self.tools.iter().map(|t| t.schema()).collect();
+
+        // Get stream from provider with tools
+        self.provider.chat_stream(&messages, Some(&tool_schemas)).await
     }
 
     /// Complete a streaming chat by adding the assistant response to the session

@@ -53,6 +53,8 @@ pub enum LLMResponse {
 pub struct StreamChunk {
     pub delta: String,
     pub done: bool,
+    /// Tool calls accumulated during streaming (only set when done=true)
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 /// Events emitted during streaming with tools
@@ -95,6 +97,7 @@ pub trait LLMProvider: Send + Sync {
             Ok(StreamChunk {
                 delta: text,
                 done: true,
+                tool_calls: None,
             })
         })))
     }
@@ -596,7 +599,7 @@ impl LLMProvider for AnthropicProvider {
     async fn chat_stream(
         &self,
         messages: &[Message],
-        _tools: Option<&[ToolSchema]>,
+        tools: Option<&[ToolSchema]>,
     ) -> Result<StreamResult> {
         let (system_prompt, formatted_messages) = self.format_messages(messages);
 
@@ -609,6 +612,13 @@ impl LLMProvider for AnthropicProvider {
 
         if let Some(system) = system_prompt {
             body["system"] = json!(system);
+        }
+
+        // Include tools so the model uses native tool_use instead of XML
+        if let Some(tools) = tools {
+            if !tools.is_empty() {
+                body["tools"] = json!(self.format_tools(tools));
+            }
         }
 
         debug!(
@@ -654,17 +664,19 @@ impl LLMProvider for AnthropicProvider {
                                         yield Ok(StreamChunk {
                                             delta: String::new(),
                                             done: true,
+                                            tool_calls: None,
                                         });
                                         continue;
                                     }
 
                                     if let Ok(json) = serde_json::from_str::<Value>(data) {
-                                        // Handle content_block_delta events
+                                        // Handle content_block_delta events (text)
                                         if json["type"] == "content_block_delta" {
                                             if let Some(delta) = json["delta"]["text"].as_str() {
                                                 yield Ok(StreamChunk {
                                                     delta: delta.to_string(),
                                                     done: false,
+                                                    tool_calls: None,
                                                 });
                                             }
                                         }
@@ -673,6 +685,7 @@ impl LLMProvider for AnthropicProvider {
                                             yield Ok(StreamChunk {
                                                 delta: String::new(),
                                                 done: true,
+                                                tool_calls: None,
                                             });
                                         }
                                         // Handle errors
@@ -854,6 +867,7 @@ impl LLMProvider for OllamaProvider {
                                 yield Ok(StreamChunk {
                                     delta: content,
                                     done,
+                                    tool_calls: None,
                                 });
                             }
                         }
