@@ -97,6 +97,8 @@ impl Server {
             .route("/api/memory/stats", get(memory_stats))
             .route("/api/memory/reindex", post(memory_reindex))
             .route("/api/status", get(status))
+            .route("/api/config", get(get_config))
+            .route("/api/saved-sessions", get(list_saved_sessions))
             .layer(cors)
             .with_state(state);
 
@@ -677,6 +679,102 @@ fn memory_reindex_inner(
         chunks_indexed: stats.chunks_indexed,
         duration_ms: stats.duration.as_millis(),
     })
+}
+
+// Config endpoint - show current configuration (safe subset)
+#[derive(Serialize)]
+struct ConfigResponse {
+    agent: AgentConfigInfo,
+    server: ServerConfigInfo,
+    memory: MemoryConfigInfo,
+    heartbeat: HeartbeatConfigInfo,
+}
+
+#[derive(Serialize)]
+struct AgentConfigInfo {
+    default_model: String,
+    context_window: usize,
+    reserve_tokens: usize,
+}
+
+#[derive(Serialize)]
+struct ServerConfigInfo {
+    port: u16,
+    bind: String,
+}
+
+#[derive(Serialize)]
+struct MemoryConfigInfo {
+    workspace: String,
+    embedding_model: String,
+    chunk_size: usize,
+    chunk_overlap: usize,
+}
+
+#[derive(Serialize)]
+struct HeartbeatConfigInfo {
+    enabled: bool,
+    interval: String,
+}
+
+async fn get_config(State(state): State<Arc<AppState>>) -> Json<ConfigResponse> {
+    Json(ConfigResponse {
+        agent: AgentConfigInfo {
+            default_model: state.config.agent.default_model.clone(),
+            context_window: state.config.agent.context_window,
+            reserve_tokens: state.config.agent.reserve_tokens,
+        },
+        server: ServerConfigInfo {
+            port: state.config.server.port,
+            bind: state.config.server.bind.clone(),
+        },
+        memory: MemoryConfigInfo {
+            workspace: state.config.memory.workspace.clone(),
+            embedding_model: state.config.memory.embedding_model.clone(),
+            chunk_size: state.config.memory.chunk_size,
+            chunk_overlap: state.config.memory.chunk_overlap,
+        },
+        heartbeat: HeartbeatConfigInfo {
+            enabled: state.config.heartbeat.enabled,
+            interval: state.config.heartbeat.interval.clone(),
+        },
+    })
+}
+
+// Saved sessions endpoint - list sessions from file store
+#[derive(Serialize)]
+struct SavedSessionInfo {
+    id: String,
+    message_count: usize,
+    created_at: String,
+}
+
+#[derive(Serialize)]
+struct SavedSessionsResponse {
+    sessions: Vec<SavedSessionInfo>,
+}
+
+async fn list_saved_sessions(State(_state): State<Arc<AppState>>) -> Response {
+    use crate::agent::list_sessions_for_agent;
+
+    match list_sessions_for_agent("main") {
+        Ok(sessions) => {
+            let session_list: Vec<SavedSessionInfo> = sessions
+                .into_iter()
+                .map(|s| SavedSessionInfo {
+                    id: s.id,
+                    message_count: s.message_count,
+                    created_at: s.created_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                })
+                .collect();
+
+            Json(SavedSessionsResponse {
+                sessions: session_list,
+            })
+            .into_response()
+        }
+        Err(e) => AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 // WebSocket handler
