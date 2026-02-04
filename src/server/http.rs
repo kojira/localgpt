@@ -9,7 +9,7 @@ use axum::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{
         sse::{Event, Sse},
         IntoResponse, Json, Response,
@@ -18,6 +18,7 @@ use axum::{
     Router,
 };
 use futures::{SinkExt, StreamExt};
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -32,6 +33,11 @@ use tracing::{debug, info};
 use crate::agent::{Agent, AgentConfig, StreamEvent};
 use crate::config::Config;
 use crate::memory::MemoryManager;
+
+/// Embedded UI assets
+#[derive(RustEmbed)]
+#[folder = "ui/"]
+struct UiAssets;
 
 /// Session timeout (30 minutes of inactivity)
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -102,6 +108,10 @@ impl Server {
             .allow_headers(Any);
 
         let app = Router::new()
+            // Web UI routes
+            .route("/", get(serve_ui_index))
+            .route("/ui/{*path}", get(serve_ui_file))
+            // API routes
             .route("/health", get(health_check))
             .route("/api/sessions", post(create_session))
             .route("/api/sessions", get(list_sessions))
@@ -291,6 +301,31 @@ async fn get_or_create_session(
 // Health check endpoint
 async fn health_check() -> &'static str {
     "OK"
+}
+
+// Serve UI index.html at root
+async fn serve_ui_index() -> Response {
+    serve_ui_asset("index.html")
+}
+
+// Serve UI static files
+async fn serve_ui_file(Path(path): Path<String>) -> Response {
+    serve_ui_asset(&path)
+}
+
+// Helper to serve embedded UI assets
+fn serve_ui_asset(path: &str) -> Response {
+    match UiAssets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            (
+                [(header::CONTENT_TYPE, mime.as_ref())],
+                content.data.to_vec(),
+            )
+                .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "Not found").into_response(),
+    }
 }
 
 // Status endpoint

@@ -46,6 +46,10 @@ notify-debouncer-mini = "0.5"
 # Token counting
 tiktoken-rs = "0.6"
 
+# Static file embedding for Web UI
+rust-embed = { version = "8", features = ["compression"] }
+mime_guess = "2.0"
+
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6.0"
