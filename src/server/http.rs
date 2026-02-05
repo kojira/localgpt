@@ -1185,7 +1185,9 @@ async fn get_daemon_logs(Query(query): Query<LogsQuery>) -> Response {
         }
     };
 
-    let log_path = state_dir.join("logs").join("daemon.log");
+    // Use date-based log file (matches daemon.rs)
+    let date = chrono::Local::now().format("%Y-%m-%d");
+    let log_path = state_dir.join("logs").join(format!("localgpt-{}.log", date));
 
     if !log_path.exists() {
         return Json(DaemonLogsResponse {
