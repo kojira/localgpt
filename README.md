@@ -110,9 +110,23 @@ When the daemon is running:
 | `GET /api/memory/search?q=<query>` | Search memory |
 | `GET /api/memory/stats` | Memory statistics |
 
+## Blog
+
+[Why I Built LocalGPT in 4 Nights](https://localgpt.app/blog/why-i-built-localgpt-in-4-nights) — the full story with commit-by-commit breakdown.
+
 ## Built With
 
 Rust, Tokio, Axum, SQLite (FTS5 + sqlite-vec), fastembed, eframe
+
+## Contributors
+
+<a href="https://github.com/localgpt-app/localgpt/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=localgpt-app/localgpt" />
+</a>
+
+## Stargazers
+
+[![Star History Chart](https://api.star-history.com/svg?repos=localgpt-app/localgpt&type=Date)](https://star-history.com/#localgpt-app/localgpt&Date)
 
 ## License
 
