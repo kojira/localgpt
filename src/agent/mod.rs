@@ -195,15 +195,29 @@ impl Agent {
         let skills_prompt = skills::build_skills_prompt(&workspace_skills);
         debug!("Loaded {} skills from workspace", workspace_skills.len());
 
+        // Load SOUL.md first - it defines who the agent is and should come before everything
+        let soul_content = self.read_soul_content();
+        let has_soul = !soul_content.is_empty();
+
         // Build system prompt with identity, safety, workspace info
         let tool_names: Vec<&str> = self.tools.iter().map(|t| t.name()).collect();
         let system_prompt_params =
             system_prompt::SystemPromptParams::new(self.memory.workspace(), &self.config.model)
                 .with_tools(tool_names)
                 .with_skills_prompt(skills_prompt);
-        let system_prompt = system_prompt::build_system_prompt(system_prompt_params);
+        let mut system_prompt = system_prompt::build_system_prompt(system_prompt_params);
 
-        // Load memory context (SOUL.md, MEMORY.md, daily logs, HEARTBEAT.md)
+        // If SOUL.md exists, remove the default identity line and prepend soul content
+        if has_soul {
+            system_prompt = system_prompt
+                .replace(
+                    "You are a personal assistant running inside LocalGPT.\n\n",
+                    "",
+                );
+            system_prompt = format!("{}\n\n{}", soul_content, system_prompt);
+        }
+
+        // Load memory context (MEMORY.md, daily logs, HEARTBEAT.md, etc. - SOUL.md excluded)
         let memory_context = self.build_memory_context().await?;
 
         // Combine system prompt with memory context
@@ -373,6 +387,25 @@ impl Agent {
         anyhow::bail!("Unknown tool: {}", call.name)
     }
 
+    /// Read SOUL.md content (persona/tone definition).
+    /// Extracted so it can be prepended before the system prompt in new_session.
+    fn read_soul_content(&self) -> String {
+        match self.memory.read_soul_file() {
+            Ok(content) if !content.is_empty() => {
+                if self.app_config.tools.use_content_delimiters {
+                    sanitize::wrap_memory_content(
+                        "SOUL.md",
+                        &content,
+                        sanitize::MemorySource::Soul,
+                    )
+                } else {
+                    content
+                }
+            }
+            _ => String::new(),
+        }
+    }
+
     async fn build_memory_context(&self) -> Result<String> {
         let mut context = String::new();
         let use_delimiters = self.app_config.tools.use_content_delimiters;
@@ -418,21 +451,8 @@ impl Agent {
             }
         }
 
-        // Load SOUL.md (persona/tone) - this defines who the agent is
-        if let Ok(soul_content) = self.memory.read_soul_file() {
-            if !soul_content.is_empty() {
-                if use_delimiters {
-                    context.push_str(&sanitize::wrap_memory_content(
-                        "SOUL.md",
-                        &soul_content,
-                        sanitize::MemorySource::Soul,
-                    ));
-                } else {
-                    context.push_str(&soul_content);
-                }
-                context.push_str("\n\n---\n\n");
-            }
-        }
+        // SOUL.md is loaded separately and prepended before system_prompt
+        // (see read_soul_content and new_session)
 
         // Load AGENTS.md (OpenClaw-compatible: list of connected agents)
         if let Ok(agents_content) = self.memory.read_agents_file() {

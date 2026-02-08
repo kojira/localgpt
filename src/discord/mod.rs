@@ -4,7 +4,9 @@ use futures::{SinkExt, StreamExt};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::{self, Duration};
@@ -100,10 +102,15 @@ struct SessionState {
     bot_user_id: Option<String>,
 }
 
+/// Rate limit interval for error messages per channel (seconds)
+const ERROR_RATE_LIMIT_SECS: u64 = 60;
+
 pub struct DiscordBot {
     config: Config,
     discord_config: DiscordChannelConfig,
     http: reqwest::Client,
+    /// Tracks last error message time per channel for rate limiting
+    last_error_sent: std::sync::Mutex<HashMap<String, Instant>>,
 }
 
 impl DiscordBot {
@@ -122,6 +129,7 @@ impl DiscordBot {
             config,
             discord_config,
             http: reqwest::Client::new(),
+            last_error_sent: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -493,9 +501,25 @@ impl DiscordBot {
             }
             Err(e) => {
                 error!("Failed to generate response: {}", e);
-                let _ = self
-                    .send_message(&msg.channel_id, "Sorry, I encountered an error.")
-                    .await;
+                // Rate-limit error messages: at most once per ERROR_RATE_LIMIT_SECS per channel
+                let should_send = {
+                    let mut map = self.last_error_sent.lock().unwrap();
+                    let now = Instant::now();
+                    match map.get(&msg.channel_id) {
+                        Some(last) if now.duration_since(*last).as_secs() < ERROR_RATE_LIMIT_SECS => false,
+                        _ => {
+                            map.insert(msg.channel_id.clone(), now);
+                            true
+                        }
+                    }
+                };
+                if should_send {
+                    let _ = self
+                        .send_message(&msg.channel_id, "Sorry, I encountered an error.")
+                        .await;
+                } else {
+                    debug!("Suppressed error message to channel {} (rate limited)", msg.channel_id);
+                }
             }
         }
     }

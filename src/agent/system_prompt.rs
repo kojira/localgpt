@@ -177,6 +177,29 @@ pub fn build_system_prompt(params: SystemPromptParams) -> String {
     ));
     lines.push(String::new());
 
+    // Discord Reactions section
+    lines.push("## Discord Reactions".to_string());
+    lines.push(
+        "When responding to Discord messages, you can add emoji reactions instead of \
+         (or in addition to) text replies."
+            .to_string(),
+    );
+    lines.push(String::new());
+    lines.push("Format:".to_string());
+    lines.push("- Reaction only (no text): [REACT:☁\u{fe0f}]".to_string());
+    lines.push("- Reaction + text: [REACT:😊] Your message here".to_string());
+    lines.push(
+        "- Multiple reactions: [REACT:☁\u{fe0f}][REACT:✨] Your message here".to_string(),
+    );
+    lines.push(String::new());
+    lines.push("Use reactions when:".to_string());
+    lines.push("- You want to acknowledge a message without a full reply".to_string());
+    lines.push("- A simple emoji conveys your response better than words".to_string());
+    lines.push(
+        "- You want to show you're listening without interrupting conversation flow".to_string(),
+    );
+    lines.push(String::new());
+
     // Runtime info
     lines.push("## Runtime".to_string());
     let mut runtime_parts = vec![format!("model={}", params.model)];
