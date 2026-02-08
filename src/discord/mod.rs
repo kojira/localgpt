@@ -343,7 +343,33 @@ impl DiscordBot {
 
                 // Send text reply unless empty or NO_REPLY
                 if !text.is_empty() && text != "NO_REPLY" {
-                    if let Err(e) =
+                    // Check if text is emoji-only (short, no ASCII characters)
+                    let trimmed = text.trim();
+                    let is_emoji_only = !trimmed.is_empty()
+                        && trimmed.len() <= 32
+                        && trimmed.chars().all(|c| !c.is_ascii() || c == '\u{fe0f}');
+
+                    if is_emoji_only {
+                        // Convert emoji-only text to reaction instead of message
+                        let first_emoji: String = trimmed
+                            .chars()
+                            .take_while(|c| !c.is_whitespace())
+                            .take(2) // Most emoji are 1-2 chars (including variation selectors)
+                            .collect();
+                        if !first_emoji.is_empty() {
+                            if let Err(e) = Self::add_reaction_static(
+                                http,
+                                token,
+                                channel_id,
+                                last_message_id,
+                                &first_emoji,
+                            )
+                            .await
+                            {
+                                error!("Failed to add emoji-only reaction {}: {}", first_emoji, e);
+                            }
+                        }
+                    } else if let Err(e) =
                         Self::send_message_static(http, token, channel_id, &text).await
                     {
                         error!("Failed to send Discord message: {}", e);
