@@ -1608,7 +1608,7 @@ impl LLMProvider for ClaudeCliProvider {
                                                 match tool_name {
                                                     "Bash" => input.get("command")
                                                         .and_then(|v| v.as_str())
-                                                        .map(|s| if s.len() > 60 { format!("{}...", &s[..57]) } else { s.to_string() }),
+                                                        .map(|s| if s.len() > 60 { format!("{}...", crate::utils::safe_truncate(s, 57)) } else { s.to_string() }),
                                                     "Read" | "Edit" | "Write" => input.get("file_path")
                                                         .or_else(|| input.get("path"))
                                                         .and_then(|v| v.as_str())

@@ -322,7 +322,7 @@ impl DiscordBot {
         match result {
             Ok(Ok(response)) => {
                 // Extract [POST:channel_id] messages for cross-channel posting
-                let post_re = Regex::new(r"\[POST:(\d+)\]\s*([^\[]*?)(?=\[POST:|\[REACT:|\z)").unwrap();
+                let post_re = Regex::new(r"\[POST:(\d+)\]\s*([^\[]*)").unwrap();
                 let mut cross_posts: Vec<(String, String)> = Vec::new();
                 for cap in post_re.captures_iter(&response) {
                     let target_channel = cap[1].to_string();
@@ -333,7 +333,7 @@ impl DiscordBot {
                 }
 
                 // Remove [POST:...] sections from response text
-                let post_remove_re = Regex::new(r"\[POST:\d+\]\s*[^\[]*?(?=\[POST:|\[REACT:|\z)").unwrap();
+                let post_remove_re = Regex::new(r"\[POST:\d+\]\s*[^\[]*").unwrap();
                 let response_cleaned = post_remove_re.replace_all(&response, "").to_string();
 
                 // Extract [REACT:emoji] tags

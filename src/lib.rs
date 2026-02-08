@@ -15,5 +15,6 @@ pub mod discord;
 pub mod heartbeat;
 pub mod memory;
 pub mod server;
+pub mod utils;
 
 pub use config::Config;
