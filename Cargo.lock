@@ -2601,6 +2601,7 @@ dependencies = [
  "notify",
  "notify-debouncer-mini",
  "once_cell",
+ "percent-encoding",
  "regex",
  "reqwest",
  "rusqlite",
