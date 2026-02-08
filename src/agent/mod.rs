@@ -33,6 +33,59 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info};
 
+/// Clean up Claude CLI session files for this workspace.
+/// Claude CLI stores sessions in ~/.claude/projects/<workspace-path-with-slashes-as-dashes>/
+pub fn clean_claude_cli_sessions(workspace: &std::path::Path) {
+    use std::fs;
+    let home = match directories::BaseDirs::new() {
+        Some(base) => base.home_dir().to_path_buf(),
+        None => {
+            tracing::warn!("Cannot determine home dir for Claude CLI cleanup");
+            return;
+        }
+    };
+    // Convert workspace path to Claude CLI folder name: /Users/kojira/foo -> -Users-kojira-foo
+    let workspace_str = workspace.to_string_lossy().replace('/', "-");
+    let claude_projects_dir = home.join(".claude").join("projects").join(&workspace_str);
+    if !claude_projects_dir.exists() {
+        tracing::debug!(
+            "No Claude CLI project dir found: {:?}",
+            claude_projects_dir
+        );
+        return;
+    }
+    // Delete all UUID session directories and .jsonl session files inside the project dir
+    match fs::read_dir(&claude_projects_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir()
+                    && path
+                        .file_name()
+                        .map(|n| n.len() == 36)
+                        .unwrap_or(false)
+                {
+                    tracing::info!("Cleaning Claude CLI session dir: {:?}", path);
+                    if let Err(e) = fs::remove_dir_all(&path) {
+                        tracing::warn!("Failed to remove {:?}: {}", path, e);
+                    }
+                } else if path.is_file()
+                    && path
+                        .extension()
+                        .map(|ext| ext == "jsonl")
+                        .unwrap_or(false)
+                {
+                    tracing::info!("Cleaning Claude CLI session file: {:?}", path);
+                    if let Err(e) = fs::remove_file(&path) {
+                        tracing::warn!("Failed to remove {:?}: {}", path, e);
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!("Failed to read Claude CLI project dir: {}", e),
+    }
+}
+
 use crate::config::Config;
 use crate::memory::{MemoryChunk, MemoryManager};
 
@@ -263,6 +316,7 @@ impl Agent {
 
         if changed {
             info!("SOUL.md changed, reloading session");
+            clean_claude_cli_sessions(self.memory.workspace());
             self.new_session().await?;
             Ok(true)
         } else {
