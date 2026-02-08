@@ -11,6 +11,7 @@ pub mod agent;
 pub mod concurrency;
 pub mod config;
 pub mod desktop;
+pub mod discord;
 pub mod heartbeat;
 pub mod memory;
 pub mod server;

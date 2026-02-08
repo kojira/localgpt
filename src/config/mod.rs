@@ -31,6 +31,9 @@ pub struct Config {
 
     #[serde(default)]
     pub tools: ToolsConfig,
+
+    #[serde(default)]
+    pub channels: ChannelsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +220,42 @@ pub struct LoggingConfig {
     /// Days to keep log files (0 = keep forever, no auto-deletion)
     #[serde(default)]
     pub retention_days: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChannelsConfig {
+    #[serde(default)]
+    pub discord: Option<DiscordChannelConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscordChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Bot token (use ${DISCORD_BOT_TOKEN} for env var expansion)
+    pub token: String,
+
+    /// Whether to process messages from other bots
+    #[serde(default)]
+    pub allow_bots: bool,
+
+    /// Guild (server) allow-list with per-guild settings
+    #[serde(default)]
+    pub guilds: Vec<DiscordGuildConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscordGuildConfig {
+    pub guild_id: String,
+
+    /// Channel IDs the bot listens in (empty = all channels)
+    #[serde(default)]
+    pub channels: Vec<String>,
+
+    /// Whether the bot must be @mentioned to respond
+    #[serde(default)]
+    pub require_mention: bool,
 }
 
 // Default value functions
@@ -448,6 +487,9 @@ impl Config {
         }
         if let Some(ref mut anthropic) = self.providers.anthropic {
             anthropic.api_key = expand_env(&anthropic.api_key);
+        }
+        if let Some(ref mut discord) = self.channels.discord {
+            discord.token = expand_env(&discord.token);
         }
     }
 
