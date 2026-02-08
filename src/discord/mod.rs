@@ -321,15 +321,48 @@ impl DiscordBot {
 
         match result {
             Ok(Ok(response)) => {
+                // Extract [POST:channel_id] messages for cross-channel posting
+                let post_re = Regex::new(r"\[POST:(\d+)\]\s*([^\[]*?)(?=\[POST:|\[REACT:|\z)").unwrap();
+                let mut cross_posts: Vec<(String, String)> = Vec::new();
+                for cap in post_re.captures_iter(&response) {
+                    let target_channel = cap[1].to_string();
+                    let post_msg = cap[2].trim().to_string();
+                    if !post_msg.is_empty() {
+                        cross_posts.push((target_channel, post_msg));
+                    }
+                }
+
+                // Remove [POST:...] sections from response text
+                let post_remove_re = Regex::new(r"\[POST:\d+\]\s*[^\[]*?(?=\[POST:|\[REACT:|\z)").unwrap();
+                let response_cleaned = post_remove_re.replace_all(&response, "").to_string();
+
                 // Extract [REACT:emoji] tags
                 let react_re = Regex::new(r"\[REACT:([^\]]+)\]").unwrap();
                 let reactions: Vec<String> = react_re
-                    .captures_iter(&response)
+                    .captures_iter(&response_cleaned)
                     .map(|c| c[1].to_string())
                     .collect();
 
                 // Remove reaction tags from response text
-                let text = react_re.replace_all(&response, "").trim().to_string();
+                let text = react_re.replace_all(&response_cleaned, "").trim().to_string();
+
+                // Send cross-channel posts (security: only to channels in configured guilds)
+                for (target_channel, post_msg) in &cross_posts {
+                    let allowed = config.channels.discord.as_ref()
+                        .map(|dc| dc.guilds.iter().any(|g| {
+                            g.channels.is_empty() || g.channels.contains(target_channel)
+                        }))
+                        .unwrap_or(false);
+                    if allowed {
+                        info!("Cross-posting to channel {}: {}", target_channel,
+                            if post_msg.len() > 40 { format!("{}...", &post_msg[..40]) } else { post_msg.clone() });
+                        if let Err(e) = Self::send_message_static(http, token, target_channel, post_msg).await {
+                            error!("Failed to cross-post to channel {}: {}", target_channel, e);
+                        }
+                    } else {
+                        warn!("Cross-post to channel {} denied: not in allowed guild channels", target_channel);
+                    }
+                }
 
                 // Add reactions to the last message in batch
                 for emoji in &reactions {
