@@ -98,6 +98,7 @@ struct MentionUser {
 struct QueuedMessage {
     channel_id: String,
     message_id: String,
+    author_name: String,
     content: String,
 }
 
@@ -197,6 +198,9 @@ impl DiscordBot {
         Ok(())
     }
 
+    /// Batch delay: wait this long after first message to collect more
+    const BATCH_DELAY: Duration = Duration::from_secs(3);
+
     async fn queue_processor(
         mut rx: mpsc::Receiver<QueuedMessage>,
         config: Config,
@@ -204,24 +208,61 @@ impl DiscordBot {
         token: String,
         last_error_sent: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
     ) {
-        while let Some(msg) = rx.recv().await {
-            Self::process_queued_message(&msg, &config, &http, &token, &last_error_sent).await;
+        while let Some(first_msg) = rx.recv().await {
+            // Collect batch: wait BATCH_DELAY, gathering any additional messages
+            let mut batch = vec![first_msg];
+            let deadline = tokio::time::Instant::now() + Self::BATCH_DELAY;
+
+            loop {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(msg)) => batch.push(msg),
+                    Ok(None) => {
+                        // Channel closed
+                        info!("Queue processor shutting down (channel closed)");
+                        return;
+                    }
+                    Err(_) => break, // Timeout reached, process the batch
+                }
+            }
+
+            info!("Processing batch of {} message(s)", batch.len());
+            Self::process_batch(&batch, &config, &http, &token, &last_error_sent).await;
         }
         info!("Queue processor shutting down (channel closed)");
     }
 
-    async fn process_queued_message(
-        msg: &QueuedMessage,
+    async fn process_batch(
+        batch: &[QueuedMessage],
         config: &Config,
         http: &reqwest::Client,
         token: &str,
         last_error_sent: &std::sync::Mutex<HashMap<String, Instant>>,
     ) {
-        // Send typing indicator
-        let _ = Self::send_typing_static(http, token, &msg.channel_id).await;
+        if batch.is_empty() {
+            return;
+        }
 
-        // Generate response via Agent
-        match Self::generate_response_static(config, &msg.content).await {
+        // Use the last message's channel_id and message_id for reactions/replies
+        let last_msg = batch.last().unwrap();
+        let channel_id = &last_msg.channel_id;
+        let last_message_id = &last_msg.message_id;
+
+        // Build combined prompt: format each message as [author] content
+        let combined_content = if batch.len() == 1 {
+            batch[0].content.clone()
+        } else {
+            batch
+                .iter()
+                .map(|m| format!("[{}] {}", m.author_name, m.content))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Send typing indicator
+        let _ = Self::send_typing_static(http, token, channel_id).await;
+
+        // Generate response via Agent (single call for entire batch)
+        match Self::generate_response_static(config, &combined_content).await {
             Ok(response) => {
                 // Extract [REACT:emoji] tags
                 let react_re = Regex::new(r"\[REACT:([^\]]+)\]").unwrap();
@@ -233,10 +274,11 @@ impl DiscordBot {
                 // Remove reaction tags from response text
                 let text = react_re.replace_all(&response, "").trim().to_string();
 
-                // Add reactions to the original message
+                // Add reactions to the last message in batch
                 for emoji in &reactions {
                     if let Err(e) =
-                        Self::add_reaction_static(http, token, &msg.channel_id, &msg.message_id, emoji).await
+                        Self::add_reaction_static(http, token, channel_id, last_message_id, emoji)
+                            .await
                     {
                         error!("Failed to add reaction {}: {}", emoji, e);
                     }
@@ -244,25 +286,26 @@ impl DiscordBot {
 
                 // Send text reply unless empty or NO_REPLY
                 if !text.is_empty() && text != "NO_REPLY" {
-                    if let Err(e) = Self::send_message_static(http, token, &msg.channel_id, &text).await {
+                    if let Err(e) =
+                        Self::send_message_static(http, token, channel_id, &text).await
+                    {
                         error!("Failed to send Discord message: {}", e);
                     }
                 }
             }
             Err(e) => {
                 error!("Failed to generate response: {}", e);
-                // Rate-limit error messages: at most once per ERROR_RATE_LIMIT_SECS per channel
                 let should_send = {
                     let mut map = last_error_sent.lock().unwrap();
                     let now = Instant::now();
-                    match map.get(&msg.channel_id) {
+                    match map.get(channel_id) {
                         Some(last)
                             if now.duration_since(*last).as_secs() < ERROR_RATE_LIMIT_SECS =>
                         {
                             false
                         }
                         _ => {
-                            map.insert(msg.channel_id.clone(), now);
+                            map.insert(channel_id.clone(), now);
                             true
                         }
                     }
@@ -271,14 +314,14 @@ impl DiscordBot {
                     let _ = Self::send_message_static(
                         http,
                         token,
-                        &msg.channel_id,
+                        channel_id,
                         "Sorry, I encountered an error.",
                     )
                     .await;
                 } else {
                     debug!(
                         "Suppressed error message to channel {} (rate limited)",
-                        msg.channel_id
+                        channel_id
                     );
                 }
             }
@@ -590,6 +633,7 @@ impl DiscordBot {
         let queued = QueuedMessage {
             channel_id: msg.channel_id.clone(),
             message_id: msg.id.clone(),
+            author_name: msg.author.username.clone(),
             content: cleaned,
         };
 
