@@ -717,7 +717,7 @@ impl Tool for WebFetchTool {
         let truncated = if body.len() > self.max_bytes {
             format!(
                 "{}...\n\n[Truncated, {} bytes total]",
-                &body[..self.max_bytes],
+                &body[..body.floor_char_boundary(self.max_bytes)],
                 body.len()
             )
         } else {
@@ -741,7 +741,7 @@ pub fn extract_tool_detail(tool_name: &str, arguments: &str) -> Option<String> {
             .map(|s| s.to_string()),
         "bash" => args.get("command").and_then(|v| v.as_str()).map(|s| {
             if s.len() > 60 {
-                format!("{}...", &s[..57])
+                format!("{}...", crate::utils::safe_truncate(s, 57))
             } else {
                 s.to_string()
             }

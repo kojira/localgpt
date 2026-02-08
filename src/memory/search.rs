@@ -38,7 +38,7 @@ impl MemoryChunk {
         if self.content.len() <= max_len {
             self.content.clone()
         } else {
-            format!("{}...", &self.content[..max_len])
+            { let truncated: String = self.content.chars().take(max_len).collect(); format!("{}...", truncated) }
         }
     }
 
