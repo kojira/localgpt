@@ -74,6 +74,8 @@ pub struct Agent {
     tools: Vec<Box<dyn Tool>>,
     /// Cumulative token usage for this session
     cumulative_usage: Usage,
+    /// Last known modification time of SOUL.md for dynamic reload
+    soul_last_modified: Option<std::time::SystemTime>,
 }
 
 impl Agent {
@@ -96,6 +98,7 @@ impl Agent {
             memory,
             tools,
             cumulative_usage: Usage::default(),
+            soul_last_modified: None,
         })
     }
 
@@ -196,6 +199,12 @@ impl Agent {
         debug!("Loaded {} skills from workspace", workspace_skills.len());
 
         // Load SOUL.md first - it defines who the agent is and should come before everything
+        let soul_path = self.memory.workspace().join("SOUL.md");
+        if let Ok(meta) = soul_path.metadata() {
+            if let Ok(modified) = meta.modified() {
+                self.soul_last_modified = Some(modified);
+            }
+        }
         let soul_content = self.read_soul_content();
         let has_soul = !soul_content.is_empty();
 
@@ -234,6 +243,31 @@ impl Agent {
 
         info!("Created new session: {}", self.session.id());
         Ok(())
+    }
+
+    /// Check if SOUL.md has been modified and reload the session if so.
+    /// Returns `Ok(true)` if the session was reloaded.
+    pub async fn check_and_reload_soul(&mut self) -> Result<bool> {
+        let soul_path = self.memory.workspace().join("SOUL.md");
+        let current_modified = match soul_path.metadata() {
+            Ok(meta) => meta.modified().ok(),
+            Err(_) => None,
+        };
+
+        let changed = match (current_modified, self.soul_last_modified) {
+            (Some(current), Some(previous)) => current != previous,
+            (Some(_), None) => true,  // First load
+            (None, Some(_)) => true,  // File deleted
+            (None, None) => false,
+        };
+
+        if changed {
+            info!("SOUL.md changed, reloading session");
+            self.new_session().await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     pub async fn resume_session(&mut self, session_id: &str) -> Result<()> {

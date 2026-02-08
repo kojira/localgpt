@@ -208,6 +208,9 @@ impl DiscordBot {
         token: String,
         last_error_sent: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
     ) {
+        // Per-channel agent map for session persistence
+        let agents: Arc<Mutex<HashMap<String, Agent>>> = Arc::new(Mutex::new(HashMap::new()));
+
         while let Some(first_msg) = rx.recv().await {
             // Collect batch: wait BATCH_DELAY, gathering any additional messages
             let mut batch = vec![first_msg];
@@ -226,7 +229,15 @@ impl DiscordBot {
             }
 
             info!("Processing batch of {} message(s)", batch.len());
-            Self::process_batch(&batch, &config, &http, &token, &last_error_sent).await;
+            Self::process_batch(
+                &batch,
+                &config,
+                &http,
+                &token,
+                &last_error_sent,
+                Arc::clone(&agents),
+            )
+            .await;
         }
         info!("Queue processor shutting down (channel closed)");
     }
@@ -237,6 +248,7 @@ impl DiscordBot {
         http: &reqwest::Client,
         token: &str,
         last_error_sent: &std::sync::Mutex<HashMap<String, Instant>>,
+        agents: Arc<Mutex<HashMap<String, Agent>>>,
     ) {
         if batch.is_empty() {
             return;
@@ -261,9 +273,54 @@ impl DiscordBot {
         // Send typing indicator
         let _ = Self::send_typing_static(http, token, channel_id).await;
 
-        // Generate response via Agent (single call for entire batch)
-        match Self::generate_response_static(config, &combined_content).await {
-            Ok(response) => {
+        // Generate response using per-channel Agent
+        let channel_id_owned = channel_id.clone();
+        let config_clone = config.clone();
+        let combined = combined_content.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                let mut agents_guard = agents.lock().await;
+
+                // Get or create Agent for this channel
+                if !agents_guard.contains_key(&channel_id_owned) {
+                    let agent_config = AgentCfg {
+                        model: config_clone.agent.default_model.clone(),
+                        context_window: config_clone.agent.context_window,
+                        reserve_tokens: config_clone.agent.reserve_tokens,
+                    };
+                    let memory = MemoryManager::new_with_full_config(
+                        &config_clone.memory,
+                        Some(&config_clone),
+                        "discord",
+                    )?;
+                    let mut agent =
+                        Agent::new(agent_config, &config_clone, memory).await?;
+                    agent.new_session().await?;
+                    agents_guard.insert(channel_id_owned.clone(), agent);
+                    info!("Created new Agent for channel {}", channel_id_owned);
+                }
+
+                let agent = agents_guard.get_mut(&channel_id_owned).unwrap();
+
+                // Check if SOUL.md changed; if so, session reloads automatically
+                if let Ok(reloaded) = agent.check_and_reload_soul().await {
+                    if reloaded {
+                        info!(
+                            "SOUL.md changed, session reloaded for channel {}",
+                            channel_id_owned
+                        );
+                    }
+                }
+
+                agent.chat(&combined).await
+            })
+        })
+        .await;
+
+        match result {
+            Ok(Ok(response)) => {
                 // Extract [REACT:emoji] tags
                 let react_re = Regex::new(r"\[REACT:([^\]]+)\]").unwrap();
                 let reactions: Vec<String> = react_re
@@ -293,37 +350,13 @@ impl DiscordBot {
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("Failed to generate response: {}", e);
-                let should_send = {
-                    let mut map = last_error_sent.lock().unwrap();
-                    let now = Instant::now();
-                    match map.get(channel_id) {
-                        Some(last)
-                            if now.duration_since(*last).as_secs() < ERROR_RATE_LIMIT_SECS =>
-                        {
-                            false
-                        }
-                        _ => {
-                            map.insert(channel_id.clone(), now);
-                            true
-                        }
-                    }
-                };
-                if should_send {
-                    let _ = Self::send_message_static(
-                        http,
-                        token,
-                        channel_id,
-                        "Sorry, I encountered an error.",
-                    )
-                    .await;
-                } else {
-                    debug!(
-                        "Suppressed error message to channel {} (rate limited)",
-                        channel_id
-                    );
-                }
+                Self::send_error_if_allowed(http, token, channel_id, last_error_sent).await;
+            }
+            Err(e) => {
+                error!("Agent task panicked: {}", e);
+                Self::send_error_if_allowed(http, token, channel_id, last_error_sent).await;
             }
         }
     }
@@ -664,37 +697,36 @@ impl DiscordBot {
         }
     }
 
-    // ─── Static methods used by queue processor ──────────────────
-
-    fn generate_response_static(
-        config: &Config,
-        message: &str,
-    ) -> impl std::future::Future<Output = Result<String>> {
-        let config = config.clone();
-        let message = message.to_string();
-
-        async move {
-            // Agent is not Send+Sync due to SQLite - run in blocking task
-            tokio::task::spawn_blocking(move || {
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(async {
-                    let agent_config = AgentCfg {
-                        model: config.agent.default_model.clone(),
-                        context_window: config.agent.context_window,
-                        reserve_tokens: config.agent.reserve_tokens,
-                    };
-
-                    let memory = MemoryManager::new_with_full_config(
-                        &config.memory,
-                        Some(&config),
-                        "discord",
-                    )?;
-                    let mut agent = Agent::new(agent_config, &config, memory).await?;
-                    agent.new_session().await?;
-                    agent.chat(&message).await
-                })
-            })
-            .await?
+    async fn send_error_if_allowed(
+        http: &reqwest::Client,
+        token: &str,
+        channel_id: &str,
+        last_error_sent: &std::sync::Mutex<HashMap<String, Instant>>,
+    ) {
+        let should_send = {
+            let mut map = last_error_sent.lock().unwrap();
+            let now = Instant::now();
+            match map.get(channel_id) {
+                Some(last) if now.duration_since(*last).as_secs() < ERROR_RATE_LIMIT_SECS => false,
+                _ => {
+                    map.insert(channel_id.to_string(), now);
+                    true
+                }
+            }
+        };
+        if should_send {
+            let _ = Self::send_message_static(
+                http,
+                token,
+                channel_id,
+                "Sorry, I encountered an error.",
+            )
+            .await;
+        } else {
+            debug!(
+                "Suppressed error message to channel {} (rate limited)",
+                channel_id
+            );
         }
     }
 
