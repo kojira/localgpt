@@ -355,7 +355,7 @@ impl DiscordBot {
                         .unwrap_or(false);
                     if allowed {
                         info!("Cross-posting to channel {}: {}", target_channel,
-                            if post_msg.len() > 40 { format!("{}...", &post_msg[..40]) } else { post_msg.clone() });
+                            if post_msg.chars().count() > 40 { format!("{}...", post_msg.chars().take(40).collect::<String>()) } else { post_msg.clone() });
                         if let Err(e) = Self::send_message_static(http, token, target_channel, post_msg).await {
                             error!("Failed to cross-post to channel {}: {}", target_channel, e);
                         }
