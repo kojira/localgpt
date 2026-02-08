@@ -1296,15 +1296,16 @@ impl ClaudeCliProvider {
             args.push(new_cli_session);
         }
 
-        // Enable tools for file operations
-        args.push("--tools".to_string());
-        args.push("Read,Write,Edit".to_string());
-
-        // Add workspace directory for tool access
+        // Add workspace directory for tool access (must come before prompt)
         args.push("--add-dir".to_string());
         args.push(self.workspace.to_string_lossy().to_string());
 
-        // Add prompt as final argument
+        // Enable tools for file operations (must come before prompt)
+        args.push("--tools".to_string());
+        args.push("Read,Write,Edit".to_string());
+
+        // Add prompt as final argument (must be last - --add-dir and --tools consume variadic args)
+        args.push("--".to_string());
         args.push(prompt.to_string());
 
         args
