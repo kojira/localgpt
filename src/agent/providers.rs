@@ -1259,6 +1259,8 @@ impl ClaudeCliProvider {
             "--output-format".to_string(),
             output_format.to_string(),
             "--dangerously-skip-permissions".to_string(),
+            "--setting-sources".to_string(),
+            "user".to_string(),
         ];
 
         // Claude CLI requires --verbose when using stream-json with --print

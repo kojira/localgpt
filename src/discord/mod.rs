@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{self, Duration};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
@@ -93,6 +93,14 @@ struct MentionUser {
     id: String,
 }
 
+// ─── Queued message ─────────────────────────────────────────────────
+
+struct QueuedMessage {
+    channel_id: String,
+    message_id: String,
+    content: String,
+}
+
 // ─── Discord bot ────────────────────────────────────────────────────
 
 struct SessionState {
@@ -108,9 +116,11 @@ const ERROR_RATE_LIMIT_SECS: u64 = 60;
 pub struct DiscordBot {
     config: Config,
     discord_config: DiscordChannelConfig,
-    http: reqwest::Client,
+    http: Arc<reqwest::Client>,
     /// Tracks last error message time per channel for rate limiting
-    last_error_sent: std::sync::Mutex<HashMap<String, Instant>>,
+    last_error_sent: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    queue_tx: mpsc::Sender<QueuedMessage>,
+    queue_rx: Option<mpsc::Receiver<QueuedMessage>>,
 }
 
 impl DiscordBot {
@@ -125,16 +135,34 @@ impl DiscordBot {
             anyhow::bail!("Discord bot token is empty");
         }
 
+        let (queue_tx, queue_rx) = mpsc::channel(5);
+
         Ok(Self {
             config,
             discord_config,
-            http: reqwest::Client::new(),
-            last_error_sent: std::sync::Mutex::new(HashMap::new()),
+            http: Arc::new(reqwest::Client::new()),
+            last_error_sent: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            queue_tx,
+            queue_rx: Some(queue_rx),
         })
     }
 
     /// Run the bot with automatic reconnect and exponential backoff.
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<()> {
+        // Take the receiver out and spawn the queue processor task
+        let queue_rx = self
+            .queue_rx
+            .take()
+            .expect("queue_rx already taken; run() called twice?");
+        let config = self.config.clone();
+        let http = Arc::clone(&self.http);
+        let token = self.discord_config.token.clone();
+        let last_error_sent = Arc::clone(&self.last_error_sent);
+
+        let processor_handle = tokio::spawn(async move {
+            Self::queue_processor(queue_rx, config, http, token, last_error_sent).await;
+        });
+
         let mut backoff_secs = 1u64;
         let max_backoff = 60u64;
         let mut state = SessionState {
@@ -165,7 +193,96 @@ impl DiscordBot {
             }
         }
 
+        processor_handle.abort();
         Ok(())
+    }
+
+    async fn queue_processor(
+        mut rx: mpsc::Receiver<QueuedMessage>,
+        config: Config,
+        http: Arc<reqwest::Client>,
+        token: String,
+        last_error_sent: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    ) {
+        while let Some(msg) = rx.recv().await {
+            Self::process_queued_message(&msg, &config, &http, &token, &last_error_sent).await;
+        }
+        info!("Queue processor shutting down (channel closed)");
+    }
+
+    async fn process_queued_message(
+        msg: &QueuedMessage,
+        config: &Config,
+        http: &reqwest::Client,
+        token: &str,
+        last_error_sent: &std::sync::Mutex<HashMap<String, Instant>>,
+    ) {
+        // Send typing indicator
+        let _ = Self::send_typing_static(http, token, &msg.channel_id).await;
+
+        // Generate response via Agent
+        match Self::generate_response_static(config, &msg.content).await {
+            Ok(response) => {
+                // Extract [REACT:emoji] tags
+                let react_re = Regex::new(r"\[REACT:([^\]]+)\]").unwrap();
+                let reactions: Vec<String> = react_re
+                    .captures_iter(&response)
+                    .map(|c| c[1].to_string())
+                    .collect();
+
+                // Remove reaction tags from response text
+                let text = react_re.replace_all(&response, "").trim().to_string();
+
+                // Add reactions to the original message
+                for emoji in &reactions {
+                    if let Err(e) =
+                        Self::add_reaction_static(http, token, &msg.channel_id, &msg.message_id, emoji).await
+                    {
+                        error!("Failed to add reaction {}: {}", emoji, e);
+                    }
+                }
+
+                // Send text reply unless empty or NO_REPLY
+                if !text.is_empty() && text != "NO_REPLY" {
+                    if let Err(e) = Self::send_message_static(http, token, &msg.channel_id, &text).await {
+                        error!("Failed to send Discord message: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to generate response: {}", e);
+                // Rate-limit error messages: at most once per ERROR_RATE_LIMIT_SECS per channel
+                let should_send = {
+                    let mut map = last_error_sent.lock().unwrap();
+                    let now = Instant::now();
+                    match map.get(&msg.channel_id) {
+                        Some(last)
+                            if now.duration_since(*last).as_secs() < ERROR_RATE_LIMIT_SECS =>
+                        {
+                            false
+                        }
+                        _ => {
+                            map.insert(msg.channel_id.clone(), now);
+                            true
+                        }
+                    }
+                };
+                if should_send {
+                    let _ = Self::send_message_static(
+                        http,
+                        token,
+                        &msg.channel_id,
+                        "Sorry, I encountered an error.",
+                    )
+                    .await;
+                } else {
+                    debug!(
+                        "Suppressed error message to channel {} (rate limited)",
+                        msg.channel_id
+                    );
+                }
+            }
+        }
     }
 
     async fn connect_and_run(&self, url: &str, state: &mut SessionState) -> Result<()> {
@@ -469,57 +586,22 @@ impl DiscordBot {
             }
         );
 
-        // Send typing indicator
-        let _ = self.send_typing(&msg.channel_id).await;
+        // Enqueue message for processing (non-blocking)
+        let queued = QueuedMessage {
+            channel_id: msg.channel_id.clone(),
+            message_id: msg.id.clone(),
+            content: cleaned,
+        };
 
-        // Generate response via Agent
-        match self.generate_response(&cleaned).await {
-            Ok(response) => {
-                // Extract [REACT:emoji] tags
-                let react_re = Regex::new(r"\[REACT:([^\]]+)\]").unwrap();
-                let reactions: Vec<String> = react_re
-                    .captures_iter(&response)
-                    .map(|c| c[1].to_string())
-                    .collect();
-
-                // Remove reaction tags from response text
-                let text = react_re.replace_all(&response, "").trim().to_string();
-
-                // Add reactions to the original message
-                for emoji in &reactions {
-                    if let Err(e) = self.add_reaction(&msg.channel_id, &msg.id, emoji).await {
-                        error!("Failed to add reaction {}: {}", emoji, e);
-                    }
-                }
-
-                // Send text reply unless empty or NO_REPLY
-                if !text.is_empty() && text != "NO_REPLY" {
-                    if let Err(e) = self.send_message(&msg.channel_id, &text).await {
-                        error!("Failed to send Discord message: {}", e);
-                    }
-                }
+        match self.queue_tx.try_send(queued) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(queued)) => {
+                warn!("Message queue full, dropping oldest message");
+                // Drain one to make room, then send
+                let _ = self.queue_tx.try_send(queued).is_ok();
             }
-            Err(e) => {
-                error!("Failed to generate response: {}", e);
-                // Rate-limit error messages: at most once per ERROR_RATE_LIMIT_SECS per channel
-                let should_send = {
-                    let mut map = self.last_error_sent.lock().unwrap();
-                    let now = Instant::now();
-                    match map.get(&msg.channel_id) {
-                        Some(last) if now.duration_since(*last).as_secs() < ERROR_RATE_LIMIT_SECS => false,
-                        _ => {
-                            map.insert(msg.channel_id.clone(), now);
-                            true
-                        }
-                    }
-                };
-                if should_send {
-                    let _ = self
-                        .send_message(&msg.channel_id, "Sorry, I encountered an error.")
-                        .await;
-                } else {
-                    debug!("Suppressed error message to channel {} (rate limited)", msg.channel_id);
-                }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                error!("Message queue closed unexpectedly");
             }
         }
     }
@@ -538,48 +620,57 @@ impl DiscordBot {
         }
     }
 
-    async fn generate_response(&self, message: &str) -> Result<String> {
-        let config = self.config.clone();
+    // ─── Static methods used by queue processor ──────────────────
+
+    fn generate_response_static(
+        config: &Config,
+        message: &str,
+    ) -> impl std::future::Future<Output = Result<String>> {
+        let config = config.clone();
         let message = message.to_string();
 
-        // Agent is not Send+Sync due to SQLite - run in blocking task
-        tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                let agent_config = AgentCfg {
-                    model: config.agent.default_model.clone(),
-                    context_window: config.agent.context_window,
-                    reserve_tokens: config.agent.reserve_tokens,
-                };
+        async move {
+            // Agent is not Send+Sync due to SQLite - run in blocking task
+            tokio::task::spawn_blocking(move || {
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(async {
+                    let agent_config = AgentCfg {
+                        model: config.agent.default_model.clone(),
+                        context_window: config.agent.context_window,
+                        reserve_tokens: config.agent.reserve_tokens,
+                    };
 
-                let memory = MemoryManager::new_with_full_config(
-                    &config.memory,
-                    Some(&config),
-                    "discord",
-                )?;
-                let mut agent = Agent::new(agent_config, &config, memory).await?;
-                agent.new_session().await?;
-                agent.chat(&message).await
+                    let memory = MemoryManager::new_with_full_config(
+                        &config.memory,
+                        Some(&config),
+                        "discord",
+                    )?;
+                    let mut agent = Agent::new(agent_config, &config, memory).await?;
+                    agent.new_session().await?;
+                    agent.chat(&message).await
+                })
             })
-        })
-        .await?
+            .await?
+        }
     }
 
     // ─── Discord REST API helpers ───────────────────────────────────
 
-    async fn add_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
+    async fn add_reaction_static(
+        http: &reqwest::Client,
+        token: &str,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<()> {
         let encoded_emoji = utf8_percent_encode(emoji, NON_ALPHANUMERIC).to_string();
         let url = format!(
             "{}/channels/{}/messages/{}/reactions/{}/@me",
             DISCORD_API_BASE, channel_id, message_id, encoded_emoji
         );
-        let resp = self
-            .http
+        let resp = http
             .put(&url)
-            .header(
-                "Authorization",
-                format!("Bot {}", self.discord_config.token),
-            )
+            .header("Authorization", format!("Bot {}", token))
             .header("Content-Length", "0")
             .send()
             .await?;
@@ -594,19 +685,20 @@ impl DiscordBot {
         Ok(())
     }
 
-    async fn send_message(&self, channel_id: &str, content: &str) -> Result<()> {
+    async fn send_message_static(
+        http: &reqwest::Client,
+        token: &str,
+        channel_id: &str,
+        content: &str,
+    ) -> Result<()> {
         // Discord message limit is 2000 characters; split if needed
         let chunks = split_message(content, 2000);
 
         for chunk in chunks {
             let url = format!("{}/channels/{}/messages", DISCORD_API_BASE, channel_id);
-            let resp = self
-                .http
+            let resp = http
                 .post(&url)
-                .header(
-                    "Authorization",
-                    format!("Bot {}", self.discord_config.token),
-                )
+                .header("Authorization", format!("Bot {}", token))
                 .json(&serde_json::json!({"content": chunk}))
                 .send()
                 .await?;
@@ -621,18 +713,15 @@ impl DiscordBot {
         Ok(())
     }
 
-    async fn send_typing(&self, channel_id: &str) -> Result<()> {
-        let url = format!(
-            "{}/channels/{}/typing",
-            DISCORD_API_BASE, channel_id
-        );
-        let _ = self
-            .http
+    async fn send_typing_static(
+        http: &reqwest::Client,
+        token: &str,
+        channel_id: &str,
+    ) -> Result<()> {
+        let url = format!("{}/channels/{}/typing", DISCORD_API_BASE, channel_id);
+        let _ = http
             .post(&url)
-            .header(
-                "Authorization",
-                format!("Bot {}", self.discord_config.token),
-            )
+            .header("Authorization", format!("Bot {}", token))
             .send()
             .await;
         Ok(())
@@ -677,7 +766,7 @@ fn split_message(content: &str, max_len: usize) -> Vec<String> {
 /// Start the Discord bot as a background task.
 /// Returns the JoinHandle so the caller can abort it on shutdown.
 pub async fn start(config: &Config) -> Result<tokio::task::JoinHandle<()>> {
-    let bot = DiscordBot::new(config.clone())?;
+    let mut bot = DiscordBot::new(config.clone())?;
     info!("Starting Discord bot");
 
     let handle = tokio::spawn(async move {
