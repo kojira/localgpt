@@ -200,6 +200,41 @@ pub fn build_system_prompt(params: SystemPromptParams) -> String {
     );
     lines.push(String::new());
 
+    // Discord Channel Tools section
+    lines.push("## Discord Channel Tools".to_string());
+    lines.push(
+        "You can browse Discord channels and read messages using special tags. \
+         Results are returned in <tool_output> tags automatically."
+            .to_string(),
+    );
+    lines.push(String::new());
+    lines.push("### List Channels".to_string());
+    lines.push("Format: [LIST:guild_id]".to_string());
+    lines.push(
+        "Lists all text channels in the specified guild (server). \
+         Example: [LIST:123456789]"
+            .to_string(),
+    );
+    lines.push(String::new());
+    lines.push("### Read Messages".to_string());
+    lines.push("Format: [READ:channel_id] or [READ:channel_id:count]".to_string());
+    lines.push(
+        "Reads recent messages from a channel. Default: 10 messages, max: 50. \
+         Example: [READ:987654321] or [READ:987654321:25]"
+            .to_string(),
+    );
+    lines.push(String::new());
+    lines.push("Notes:".to_string());
+    lines.push("- Only channels in configured guilds are accessible".to_string());
+    lines.push(
+        "- You can use LIST first to discover channel IDs, then READ to view messages".to_string(),
+    );
+    lines.push(
+        "- After using these tags, you will receive tool output and can then respond normally"
+            .to_string(),
+    );
+    lines.push(String::new());
+
     // Runtime info
     lines.push("## Runtime".to_string());
     let mut runtime_parts = vec![format!("model={}", params.model)];

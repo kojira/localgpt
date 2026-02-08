@@ -93,6 +93,30 @@ struct MentionUser {
     id: String,
 }
 
+// ─── REST API response types ────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct DiscordChannelInfo {
+    id: String,
+    #[serde(rename = "type")]
+    channel_type: u8,
+    #[serde(default)]
+    name: String,
+    topic: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordMessageEntry {
+    content: String,
+    author: MessageAuthor,
+    timestamp: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelDetail {
+    guild_id: Option<String>,
+}
+
 // ─── Queued message ─────────────────────────────────────────────────
 
 struct QueuedMessage {
@@ -277,11 +301,12 @@ impl DiscordBot {
         let channel_id_owned = channel_id.clone();
         let config_clone = config.clone();
         let combined = combined_content.clone();
+        let agents_init = Arc::clone(&agents);
 
         let result = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
             rt.block_on(async {
-                let mut agents_guard = agents.lock().await;
+                let mut agents_guard = agents_init.lock().await;
 
                 // Get or create Agent for this channel
                 if !agents_guard.contains_key(&channel_id_owned) {
@@ -319,103 +344,171 @@ impl DiscordBot {
         })
         .await;
 
-        match result {
-            Ok(Ok(response)) => {
-                // Extract [POST:channel_id] messages for cross-channel posting
-                let post_re = Regex::new(r"\[POST:(\d+)\]\s*([^\[]*)").unwrap();
-                let mut cross_posts: Vec<(String, String)> = Vec::new();
-                for cap in post_re.captures_iter(&response) {
-                    let target_channel = cap[1].to_string();
-                    let post_msg = cap[2].trim().to_string();
-                    if !post_msg.is_empty() {
-                        cross_posts.push((target_channel, post_msg));
-                    }
-                }
-
-                // Remove [POST:...] sections from response text
-                let post_remove_re = Regex::new(r"\[POST:\d+\]\s*[^\[]*").unwrap();
-                let response_cleaned = post_remove_re.replace_all(&response, "").to_string();
-
-                // Extract [REACT:emoji] tags
-                let react_re = Regex::new(r"\[REACT:([^\]]+)\]").unwrap();
-                let reactions: Vec<String> = react_re
-                    .captures_iter(&response_cleaned)
-                    .map(|c| c[1].to_string())
-                    .collect();
-
-                // Remove reaction tags from response text
-                let text = react_re.replace_all(&response_cleaned, "").trim().to_string();
-
-                // Send cross-channel posts (security: only to channels in configured guilds)
-                for (target_channel, post_msg) in &cross_posts {
-                    let allowed = config.channels.discord.as_ref()
-                        .map(|dc| dc.guilds.iter().any(|g| {
-                            g.channels.is_empty() || g.channels.contains(target_channel)
-                        }))
-                        .unwrap_or(false);
-                    if allowed {
-                        info!("Cross-posting to channel {}: {}", target_channel,
-                            if post_msg.chars().count() > 40 { format!("{}...", post_msg.chars().take(40).collect::<String>()) } else { post_msg.clone() });
-                        if let Err(e) = Self::send_message_static(http, token, target_channel, post_msg).await {
-                            error!("Failed to cross-post to channel {}: {}", target_channel, e);
-                        }
-                    } else {
-                        warn!("Cross-post to channel {} denied: not in allowed guild channels", target_channel);
-                    }
-                }
-
-                // Add reactions to the last message in batch
-                for emoji in &reactions {
-                    if let Err(e) =
-                        Self::add_reaction_static(http, token, channel_id, last_message_id, emoji)
-                            .await
-                    {
-                        error!("Failed to add reaction {}: {}", emoji, e);
-                    }
-                }
-
-                // Send text reply unless empty or NO_REPLY
-                if !text.is_empty() && text != "NO_REPLY" {
-                    // Check if text is emoji-only (short, no ASCII characters)
-                    let trimmed = text.trim();
-                    let is_emoji_only = !trimmed.is_empty()
-                        && trimmed.len() <= 32
-                        && trimmed.chars().all(|c| !c.is_ascii() || c == '\u{fe0f}');
-
-                    if is_emoji_only {
-                        // Convert emoji-only text to reaction instead of message
-                        let first_emoji: String = trimmed
-                            .chars()
-                            .take_while(|c| !c.is_whitespace())
-                            .take(2) // Most emoji are 1-2 chars (including variation selectors)
-                            .collect();
-                        if !first_emoji.is_empty() {
-                            if let Err(e) = Self::add_reaction_static(
-                                http,
-                                token,
-                                channel_id,
-                                last_message_id,
-                                &first_emoji,
-                            )
-                            .await
-                            {
-                                error!("Failed to add emoji-only reaction {}: {}", first_emoji, e);
-                            }
-                        }
-                    } else if let Err(e) =
-                        Self::send_message_static(http, token, channel_id, &text).await
-                    {
-                        error!("Failed to send Discord message: {}", e);
-                    }
-                }
-            }
+        let mut response = match result {
+            Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 error!("Failed to generate response: {}", e);
                 Self::send_error_if_allowed(http, token, channel_id, last_error_sent).await;
+                return;
             }
             Err(e) => {
                 error!("Agent task panicked: {}", e);
                 Self::send_error_if_allowed(http, token, channel_id, last_error_sent).await;
+                return;
+            }
+        };
+
+        // Tool output loop: process [LIST:...] and [READ:...] tags (max 3 iterations)
+        for iteration in 0..3 {
+            let tool_output =
+                Self::execute_tool_tags(&response, config, http, token).await;
+            if tool_output.is_empty() {
+                break;
+            }
+            info!(
+                "Tool output loop iteration {} for channel {}",
+                iteration + 1,
+                channel_id
+            );
+            let _ = Self::send_typing_static(http, token, channel_id).await;
+
+            let agents_loop = Arc::clone(&agents);
+            let ch_id = channel_id.clone();
+            let tool_msg = tool_output;
+
+            let loop_result = tokio::task::spawn_blocking(move || {
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(async {
+                    let mut guard = agents_loop.lock().await;
+                    let agent = guard
+                        .get_mut(&ch_id)
+                        .ok_or_else(|| anyhow::anyhow!("Agent not found for channel"))?;
+                    agent.chat(&tool_msg).await
+                })
+            })
+            .await;
+
+            match loop_result {
+                Ok(Ok(r)) => response = r,
+                Ok(Err(e)) => {
+                    error!("Tool output loop error: {}", e);
+                    break;
+                }
+                Err(e) => {
+                    error!("Tool output loop task panicked: {}", e);
+                    break;
+                }
+            }
+        }
+
+        // --- Process final response tags ---
+
+        // Extract [POST:channel_id] messages for cross-channel posting
+        let post_re = Regex::new(r"\[POST:(\d+)\]\s*([^\[]*)").unwrap();
+        let mut cross_posts: Vec<(String, String)> = Vec::new();
+        for cap in post_re.captures_iter(&response) {
+            let target_channel = cap[1].to_string();
+            let post_msg = cap[2].trim().to_string();
+            if !post_msg.is_empty() {
+                cross_posts.push((target_channel, post_msg));
+            }
+        }
+
+        // Remove [POST:...] sections from response text
+        let post_remove_re = Regex::new(r"\[POST:\d+\]\s*[^\[]*").unwrap();
+        let response_cleaned = post_remove_re.replace_all(&response, "").to_string();
+
+        // Extract [REACT:emoji] tags
+        let react_re = Regex::new(r"\[REACT:([^\]]+)\]").unwrap();
+        let reactions: Vec<String> = react_re
+            .captures_iter(&response_cleaned)
+            .map(|c| c[1].to_string())
+            .collect();
+
+        // Remove reaction tags and any remaining [LIST:...]/[READ:...] tags
+        let text = react_re.replace_all(&response_cleaned, "").to_string();
+        let tool_tag_re = Regex::new(r"\[(?:LIST|READ):\d+(?::\d+)?\]").unwrap();
+        let text = tool_tag_re.replace_all(&text, "").trim().to_string();
+
+        // Send cross-channel posts (security: only to channels in configured guilds)
+        for (target_channel, post_msg) in &cross_posts {
+            let allowed = config
+                .channels
+                .discord
+                .as_ref()
+                .map(|dc| {
+                    dc.guilds
+                        .iter()
+                        .any(|g| g.channels.is_empty() || g.channels.contains(target_channel))
+                })
+                .unwrap_or(false);
+            if allowed {
+                info!(
+                    "Cross-posting to channel {}: {}",
+                    target_channel,
+                    if post_msg.chars().count() > 40 {
+                        format!(
+                            "{}...",
+                            post_msg.chars().take(40).collect::<String>()
+                        )
+                    } else {
+                        post_msg.clone()
+                    }
+                );
+                if let Err(e) =
+                    Self::send_message_static(http, token, target_channel, post_msg).await
+                {
+                    error!("Failed to cross-post to channel {}: {}", target_channel, e);
+                }
+            } else {
+                warn!(
+                    "Cross-post to channel {} denied: not in allowed guild channels",
+                    target_channel
+                );
+            }
+        }
+
+        // Add reactions to the last message in batch
+        for emoji in &reactions {
+            if let Err(e) =
+                Self::add_reaction_static(http, token, channel_id, last_message_id, emoji).await
+            {
+                error!("Failed to add reaction {}: {}", emoji, e);
+            }
+        }
+
+        // Send text reply unless empty or NO_REPLY
+        if !text.is_empty() && text != "NO_REPLY" {
+            // Check if text is emoji-only (short, no ASCII characters)
+            let trimmed = text.trim();
+            let is_emoji_only = !trimmed.is_empty()
+                && trimmed.len() <= 32
+                && trimmed.chars().all(|c| !c.is_ascii() || c == '\u{fe0f}');
+
+            if is_emoji_only {
+                // Convert emoji-only text to reaction instead of message
+                let first_emoji: String = trimmed
+                    .chars()
+                    .take_while(|c| !c.is_whitespace())
+                    .take(2) // Most emoji are 1-2 chars (including variation selectors)
+                    .collect();
+                if !first_emoji.is_empty() {
+                    if let Err(e) = Self::add_reaction_static(
+                        http,
+                        token,
+                        channel_id,
+                        last_message_id,
+                        &first_emoji,
+                    )
+                    .await
+                    {
+                        error!("Failed to add emoji-only reaction {}: {}", first_emoji, e);
+                    }
+                }
+            } else if let Err(e) =
+                Self::send_message_static(http, token, channel_id, &text).await
+            {
+                error!("Failed to send Discord message: {}", e);
             }
         }
     }
@@ -861,6 +954,212 @@ impl DiscordBot {
             .await;
         Ok(())
     }
+
+    // ─── Discord channel tools (LIST/READ) ──────────────────────────
+
+    /// List channels in a guild via REST API
+    async fn list_channels_static(
+        http: &reqwest::Client,
+        token: &str,
+        guild_id: &str,
+    ) -> Result<String> {
+        let url = format!("{}/guilds/{}/channels", DISCORD_API_BASE, guild_id);
+        let resp = http
+            .get(&url)
+            .header("Authorization", format!("Bot {}", token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Discord API error {}: {}", status, body);
+        }
+
+        let channels: Vec<DiscordChannelInfo> = resp.json().await?;
+        // Filter to text channels (0) and announcement channels (5)
+        let formatted: Vec<String> = channels
+            .iter()
+            .filter(|c| c.channel_type == 0 || c.channel_type == 5)
+            .map(|c| match c.topic.as_deref().filter(|t| !t.is_empty()) {
+                Some(topic) => format!("{} (ID: {}) - {}", c.name, c.id, topic),
+                None => format!("{} (ID: {})", c.name, c.id),
+            })
+            .collect();
+
+        Ok(formatted.join("\n"))
+    }
+
+    /// Read recent messages from a channel via REST API
+    async fn read_messages_static(
+        http: &reqwest::Client,
+        token: &str,
+        channel_id: &str,
+        limit: u32,
+    ) -> Result<String> {
+        let limit = limit.clamp(1, 50);
+        let url = format!(
+            "{}/channels/{}/messages?limit={}",
+            DISCORD_API_BASE, channel_id, limit
+        );
+        let resp = http
+            .get(&url)
+            .header("Authorization", format!("Bot {}", token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Discord API error {}: {}", status, body);
+        }
+
+        let mut messages: Vec<DiscordMessageEntry> = resp.json().await?;
+        // Discord returns newest first; reverse for chronological order
+        messages.reverse();
+
+        let formatted: Vec<String> = messages
+            .iter()
+            .map(|m| {
+                let time = extract_time_from_timestamp(&m.timestamp);
+                format!("[{} {}] {}", m.author.username, time, m.content)
+            })
+            .collect();
+
+        Ok(formatted.join("\n"))
+    }
+
+    /// Get a channel's guild_id for security validation
+    async fn get_channel_guild_static(
+        http: &reqwest::Client,
+        token: &str,
+        channel_id: &str,
+    ) -> Result<String> {
+        let url = format!("{}/channels/{}", DISCORD_API_BASE, channel_id);
+        let resp = http
+            .get(&url)
+            .header("Authorization", format!("Bot {}", token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to get channel info");
+        }
+
+        let info: ChannelDetail = resp.json().await?;
+        info.guild_id
+            .ok_or_else(|| anyhow::anyhow!("Channel has no guild_id (DM channel?)"))
+    }
+
+    /// Execute [LIST:...] and [READ:...] tool tags found in a response.
+    /// Returns a tool_output string to feed back to the agent, or empty if no tags found.
+    async fn execute_tool_tags(
+        response: &str,
+        config: &Config,
+        http: &reqwest::Client,
+        token: &str,
+    ) -> String {
+        let mut outputs = Vec::new();
+
+        // Parse [LIST:guild_id]
+        let list_re = Regex::new(r"\[LIST:(\d+)\]").unwrap();
+        for cap in list_re.captures_iter(response) {
+            let guild_id = cap[1].to_string();
+            let allowed = config
+                .channels
+                .discord
+                .as_ref()
+                .map(|dc| dc.guilds.iter().any(|g| g.guild_id == guild_id))
+                .unwrap_or(false);
+
+            if allowed {
+                match Self::list_channels_static(http, token, &guild_id).await {
+                    Ok(result) => {
+                        info!("Listed channels for guild {}", guild_id);
+                        outputs.push(format!(
+                            "<tool_output>\n[LIST:{}] channels:\n{}\n</tool_output>",
+                            guild_id, result
+                        ));
+                    }
+                    Err(e) => {
+                        error!("Failed to list channels for guild {}: {}", guild_id, e);
+                        outputs.push(format!(
+                            "<tool_output>\n[LIST:{}] error: {}\n</tool_output>",
+                            guild_id, e
+                        ));
+                    }
+                }
+            } else {
+                warn!("LIST denied for guild {}: not in allowed list", guild_id);
+                outputs.push(format!(
+                    "<tool_output>\n[LIST:{}] error: guild not in allowed list\n</tool_output>",
+                    guild_id
+                ));
+            }
+        }
+
+        // Parse [READ:channel_id] and [READ:channel_id:count]
+        let read_re = Regex::new(r"\[READ:(\d+)(?::(\d+))?\]").unwrap();
+        for cap in read_re.captures_iter(response) {
+            let channel_id = cap[1].to_string();
+            let count: u32 = cap
+                .get(2)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(10)
+                .min(50);
+
+            // Security: verify channel belongs to an allowed guild
+            let allowed =
+                match Self::get_channel_guild_static(http, token, &channel_id).await {
+                    Ok(guild_id) => config
+                        .channels
+                        .discord
+                        .as_ref()
+                        .map(|dc| dc.guilds.iter().any(|g| g.guild_id == guild_id))
+                        .unwrap_or(false),
+                    Err(e) => {
+                        warn!(
+                            "Could not verify guild for channel {}: {}",
+                            channel_id, e
+                        );
+                        false
+                    }
+                };
+
+            if allowed {
+                match Self::read_messages_static(http, token, &channel_id, count).await {
+                    Ok(result) => {
+                        info!("Read {} messages from channel {}", count, channel_id);
+                        outputs.push(format!(
+                            "<tool_output>\n[READ:{}] messages:\n{}\n</tool_output>",
+                            channel_id, result
+                        ));
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to read messages from channel {}: {}",
+                            channel_id, e
+                        );
+                        outputs.push(format!(
+                            "<tool_output>\n[READ:{}] error: {}\n</tool_output>",
+                            channel_id, e
+                        ));
+                    }
+                }
+            } else {
+                warn!(
+                    "READ denied for channel {}: not in allowed guild",
+                    channel_id
+                );
+                outputs.push(format!(
+                    "<tool_output>\n[READ:{}] error: channel not in allowed guild\n</tool_output>",
+                    channel_id
+                ));
+            }
+        }
+
+        outputs.join("\n\n")
+    }
 }
 
 /// Split a message into chunks respecting the Discord character limit.
@@ -896,6 +1195,18 @@ fn split_message(content: &str, max_len: usize) -> Vec<String> {
     }
 
     chunks
+}
+
+/// Extract HH:MM from a Discord ISO 8601 timestamp
+fn extract_time_from_timestamp(ts: &str) -> String {
+    // Discord timestamp format: "2026-02-09T10:30:00.000000+00:00"
+    if let Some(t_pos) = ts.find('T') {
+        let time_part = &ts[t_pos + 1..];
+        if time_part.len() >= 5 {
+            return time_part[..5].to_string();
+        }
+    }
+    "??:??".to_string()
 }
 
 /// Start the Discord bot as a background task.
