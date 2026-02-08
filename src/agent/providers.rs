@@ -1365,6 +1365,21 @@ fn extract_system_prompt(messages: &[Message]) -> Option<String> {
 fn parse_claude_cli_output(stdout: &str) -> Result<(String, Option<String>)> {
     // Claude CLI outputs JSON with message content and session info
     if let Ok(json) = serde_json::from_str::<Value>(stdout) {
+        // Check for error responses: {"type": "result", "subtype": "error_during_execution", ...}
+        let is_error = json.get("type").and_then(|v| v.as_str()) == Some("result")
+            && json.get("subtype").and_then(|v| v.as_str()) == Some("error_during_execution");
+
+        if is_error {
+            // Extract error message from the JSON if available
+            let error_msg = json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .or_else(|| json.get("error_message").and_then(|v| v.as_str()))
+                .unwrap_or("Unknown Claude CLI error");
+            tracing::error!("Claude CLI error response: {}", error_msg);
+            return Err(anyhow::anyhow!("Claude CLI error: {}", error_msg));
+        }
+
         // Extract response text (try multiple field names)
         let text = json
             .get("result")
@@ -1372,7 +1387,16 @@ fn parse_claude_cli_output(stdout: &str) -> Result<(String, Option<String>)> {
             .or_else(|| json.get("content"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| stdout.trim().to_string());
+            .unwrap_or_else(|| {
+                // If no known field found and it looks like raw JSON, don't leak it
+                let trimmed = stdout.trim();
+                if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                    tracing::warn!("Claude CLI returned unrecognized JSON, suppressing raw output");
+                    String::new()
+                } else {
+                    trimmed.to_string()
+                }
+            });
 
         // Extract session ID (try multiple field names per OpenClaw pattern)
         let session_id = json
