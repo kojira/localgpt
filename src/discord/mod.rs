@@ -174,6 +174,12 @@ impl DiscordBot {
 
     /// Run the bot with automatic reconnect and exponential backoff.
     pub async fn run(&mut self) -> Result<()> {
+        self.run_with_agents(Arc::new(Mutex::new(HashMap::new())))
+            .await
+    }
+
+    /// Run the bot with a shared agent map (for HTTP server visibility).
+    pub async fn run_with_agents(&mut self, agents: SharedAgentMap) -> Result<()> {
         // Take the receiver out and spawn the queue processor task
         let queue_rx = self
             .queue_rx
@@ -185,7 +191,7 @@ impl DiscordBot {
         let last_error_sent = Arc::clone(&self.last_error_sent);
 
         let processor_handle = tokio::spawn(async move {
-            Self::queue_processor(queue_rx, config, http, token, last_error_sent).await;
+            Self::queue_processor(queue_rx, config, http, token, last_error_sent, agents).await;
         });
 
         let mut backoff_secs = 1u64;
@@ -231,9 +237,8 @@ impl DiscordBot {
         http: Arc<reqwest::Client>,
         token: String,
         last_error_sent: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+        agents: SharedAgentMap,
     ) {
-        // Per-channel agent map for session persistence
-        let agents: Arc<Mutex<HashMap<String, Agent>>> = Arc::new(Mutex::new(HashMap::new()));
 
         while let Some(first_msg) = rx.recv().await {
             // Collect batch: wait BATCH_DELAY, gathering any additional messages
@@ -1417,14 +1422,23 @@ fn extract_time_from_timestamp(ts: &str) -> String {
     "??:??".to_string()
 }
 
+/// Type alias for shared Discord agent map (channel_id → Agent)
+pub type SharedAgentMap = Arc<Mutex<HashMap<String, Agent>>>;
+
 /// Start the Discord bot as a background task.
 /// Returns the JoinHandle so the caller can abort it on shutdown.
-pub async fn start(config: &Config) -> Result<tokio::task::JoinHandle<()>> {
+/// If `agents` is provided, the bot shares this agent map (visible to HTTP server).
+/// If `None`, an internal map is created.
+pub async fn start(
+    config: &Config,
+    agents: Option<SharedAgentMap>,
+) -> Result<tokio::task::JoinHandle<()>> {
     let mut bot = DiscordBot::new(config.clone())?;
+    let agents = agents.unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
     info!("Starting Discord bot");
 
     let handle = tokio::spawn(async move {
-        if let Err(e) = bot.run().await {
+        if let Err(e) = bot.run_with_agents(agents).await {
             error!("Discord bot exited with error: {}", e);
         }
     });
