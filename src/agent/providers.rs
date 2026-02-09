@@ -1112,6 +1112,35 @@ impl LLMProvider for OllamaProvider {
     }
 }
 
+/// Save image attachments to temp directory for Claude CLI consumption.
+/// Returns (list of file paths, temp directory path).
+fn save_images_to_temp(images: &[ImageAttachment]) -> Result<(Vec<String>, String)> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use std::fs;
+
+    let dir = "/tmp/localgpt-images";
+    fs::create_dir_all(dir)?;
+
+    let mut paths = Vec::new();
+    for (i, img) in images.iter().enumerate() {
+        let ext = img
+            .media_type
+            .strip_prefix("image/")
+            .unwrap_or("png");
+        let path = format!("{}/image-{}.{}", dir, i, ext);
+        let data = STANDARD.decode(&img.data)?;
+        fs::write(&path, &data)?;
+        paths.push(path);
+    }
+
+    Ok((paths, dir.to_string()))
+}
+
+/// Remove the temp images directory.
+fn cleanup_temp_images(dir: &str) {
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Claude CLI Provider - invokes the `claude` CLI command
 /// No tool support (text in → text out only)
 /// No streaming (CLI output is collected then returned)
@@ -1157,12 +1186,13 @@ impl ClaudeCliProvider {
         prompt: &str,
         system_prompt: Option<&str>,
         existing_session: Option<&str>,
+        additional_dirs: &[String],
     ) -> Result<(std::process::Output, bool)> {
         use std::process::Command;
 
         // First attempt: try with existing session if available
         if let Some(cli_sid) = existing_session {
-            let args = self.build_cli_args(prompt, system_prompt, Some(cli_sid), false);
+            let args = self.build_cli_args(prompt, system_prompt, Some(cli_sid), false, additional_dirs);
 
             debug!(
                 "Claude CLI (resume): {} {:?} (cwd: {:?})",
@@ -1207,7 +1237,7 @@ impl ClaudeCliProvider {
         }
 
         // Create new session
-        let args = self.build_cli_args(prompt, system_prompt, None, true);
+        let args = self.build_cli_args(prompt, system_prompt, None, true, additional_dirs);
 
         debug!(
             "Claude CLI (new): {} {:?} (cwd: {:?})",
@@ -1242,6 +1272,7 @@ impl ClaudeCliProvider {
         system_prompt: Option<&str>,
         resume_session: Option<&str>,
         is_new_session: bool,
+        additional_dirs: &[String],
     ) -> Vec<String> {
         self.build_cli_args_with_format(
             prompt,
@@ -1249,6 +1280,7 @@ impl ClaudeCliProvider {
             resume_session,
             is_new_session,
             "json",
+            additional_dirs,
         )
     }
 
@@ -1260,6 +1292,7 @@ impl ClaudeCliProvider {
         resume_session: Option<&str>,
         is_new_session: bool,
         output_format: &str,
+        additional_dirs: &[String],
     ) -> Vec<String> {
         let mut args = vec![
             "-p".to_string(),
@@ -1306,6 +1339,12 @@ impl ClaudeCliProvider {
         // Add workspace directory for tool access (must come before prompt)
         args.push("--add-dir".to_string());
         args.push(self.workspace.to_string_lossy().to_string());
+
+        // Add any additional directories (e.g., temp image dirs)
+        for dir in additional_dirs {
+            args.push("--add-dir".to_string());
+            args.push(dir.clone());
+        }
 
         // Enable tools for file operations (must come before prompt)
         args.push("--tools".to_string());
@@ -1429,8 +1468,29 @@ impl LLMProvider for ClaudeCliProvider {
         _tools: Option<&[ToolSchema]>, // Ignored - no tool support
     ) -> Result<LLMResponse> {
         // Build prompt from messages (last user message)
-        let prompt = build_prompt_from_messages(messages);
+        let mut prompt = build_prompt_from_messages(messages);
         let system_prompt = extract_system_prompt(messages);
+
+        // Check if the last user message has images
+        let image_temp = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User && !m.images.is_empty())
+            .map(|m| save_images_to_temp(&m.images))
+            .transpose()?;
+
+        let additional_dirs: Vec<String> = if let Some((ref paths, ref dir)) = image_temp {
+            // Prepend image file references to the prompt
+            let image_lines: String = paths
+                .iter()
+                .map(|p| format!("[Attached image: {}]", p))
+                .collect::<Vec<_>>()
+                .join("\n");
+            prompt = format!("{}\n\n{}", image_lines, prompt);
+            vec![dir.clone()]
+        } else {
+            vec![]
+        };
 
         // Get current CLI session state
         let current_cli_session = self
@@ -1440,13 +1500,21 @@ impl LLMProvider for ClaudeCliProvider {
             .clone();
 
         // Try to execute with current session, fall back to new session if not found
-        let (output, used_new_session) = self
+        let result = self
             .execute_cli_command(
                 &prompt,
                 system_prompt.as_deref(),
                 current_cli_session.as_deref(),
+                &additional_dirs,
             )
-            .await?;
+            .await;
+
+        // Clean up temp images regardless of success/failure
+        if let Some((_, ref dir)) = image_temp {
+            cleanup_temp_images(dir);
+        }
+
+        let (output, used_new_session) = result?;
 
         // Parse JSON output and extract session ID
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1503,8 +1571,29 @@ impl LLMProvider for ClaudeCliProvider {
         _tools: Option<&[ToolSchema]>,
     ) -> Result<StreamResult> {
         // Build prompt from messages (last user message)
-        let prompt = build_prompt_from_messages(messages);
+        let mut prompt = build_prompt_from_messages(messages);
         let system_prompt = extract_system_prompt(messages);
+
+        // Check if the last user message has images
+        let image_temp = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User && !m.images.is_empty())
+            .map(|m| save_images_to_temp(&m.images))
+            .transpose()?;
+
+        let additional_dirs: Vec<String> = if let Some((ref paths, ref dir)) = image_temp {
+            // Prepend image file references to the prompt
+            let image_lines: String = paths
+                .iter()
+                .map(|p| format!("[Attached image: {}]", p))
+                .collect::<Vec<_>>()
+                .join("\n");
+            prompt = format!("{}\n\n{}", image_lines, prompt);
+            vec![dir.clone()]
+        } else {
+            vec![]
+        };
 
         // Get current CLI session state
         let current_cli_session = self
@@ -1527,6 +1616,7 @@ impl LLMProvider for ClaudeCliProvider {
             resume_session.as_deref(),
             is_new_session,
             "stream-json",
+            &additional_dirs,
         );
 
         debug!(
@@ -1553,6 +1643,9 @@ impl LLMProvider for ClaudeCliProvider {
         let session_key = self.session_key.clone();
         let localgpt_session_id = self.localgpt_session_id.clone();
         let cli_session_mutex = std::sync::Arc::new(StdMutex::new(cli_session_id));
+
+        // Move temp dir path into the stream for cleanup
+        let image_temp_dir = image_temp.map(|(_, dir)| dir);
 
         // Create the stream
         let stream = async_stream::stream! {
@@ -1773,6 +1866,11 @@ impl LLMProvider for ClaudeCliProvider {
             // Update the provider's session state if we captured a new session ID
             if let Some(ref new_sid) = session_id_captured {
                 info!("Claude CLI streaming session: {}", new_sid);
+            }
+
+            // Clean up temp images after stream completes
+            if let Some(ref dir) = image_temp_dir {
+                cleanup_temp_images(dir);
             }
         };
 
