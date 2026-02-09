@@ -150,6 +150,29 @@ async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
     // Create shared turn gate for heartbeat + HTTP concurrency control
     let turn_gate = TurnGate::new();
 
+    // Spawn Discord bot in background if enabled
+    let discord_handle = if config
+        .channels
+        .discord
+        .as_ref()
+        .map(|d| d.enabled)
+        .unwrap_or(false)
+    {
+        match localgpt::discord::start(config).await {
+            Ok(handle) => {
+                println!("  Discord: enabled");
+                Some(handle)
+            }
+            Err(e) => {
+                tracing::error!("Failed to start Discord bot: {}", e);
+                println!("  Discord: failed to start ({})", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Spawn heartbeat in background if enabled
     let heartbeat_handle = if config.heartbeat.enabled {
         let heartbeat_config = config.clone();
@@ -196,8 +219,11 @@ async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
         tokio::signal::ctrl_c().await?;
     }
 
-    // Abort heartbeat task on shutdown
+    // Abort background tasks on shutdown
     if let Some(handle) = heartbeat_handle {
+        handle.abort();
+    }
+    if let Some(handle) = discord_handle {
         handle.abort();
     }
 

@@ -132,6 +132,48 @@ Rust, Tokio, Axum, SQLite (FTS5 + sqlite-vec), fastembed, eframe
 
 [![Star History Chart](https://api.star-history.com/svg?repos=localgpt-app/localgpt&type=Date)](https://star-history.com/#localgpt-app/localgpt&Date)
 
+## Discord Integration
+
+LocalGPT can connect to Discord as a bot, responding to messages in specified channels.
+
+### Configuration
+
+Add to `~/.localgpt/config.toml`:
+
+```toml
+[channels.discord]
+enabled = true
+token = "${DISCORD_BOT_TOKEN}"
+allow_bots = false
+
+[[channels.discord.guilds]]
+guild_id = "123456789012345678"
+channels = ["987654321098765432"]  # Empty = all channels
+require_mention = false            # true = only respond when @mentioned
+```
+
+Start the daemon to activate:
+
+```bash
+localgpt daemon start
+```
+
+### Known Issues & Workarounds
+
+| Issue | Cause | Workaround |
+|-------|-------|------------|
+| CLAUDE.md interference | Claude CLI loads project CLAUDE.md, conflicting with SOUL.md persona | `--setting-sources user` flag (already applied) |
+| Session history pollution | Stale session history overrides SOUL.md persona changes | Automatic session cleanup on SOUL.md change detection |
+| SOUL.md dynamic reload | Persona changes require session restart | Auto-detected via file modification time; triggers session reset |
+
+### Batch Message Processing
+
+When multiple Discord messages arrive in quick succession, LocalGPT batches them together before sending to the LLM. This reduces API calls and provides better context for responses.
+
+- Messages within the batch window are combined into a single prompt
+- Each message includes the sender's username for context
+- Per-channel sessions maintain conversation continuity
+
 ## License
 
 [Apache-2.0](LICENSE)

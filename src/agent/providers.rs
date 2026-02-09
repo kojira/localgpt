@@ -1266,6 +1266,8 @@ impl ClaudeCliProvider {
             "--output-format".to_string(),
             output_format.to_string(),
             "--dangerously-skip-permissions".to_string(),
+            "--setting-sources".to_string(),
+            "user".to_string(),
         ];
 
         // Claude CLI requires --verbose when using stream-json with --print
@@ -1301,7 +1303,16 @@ impl ClaudeCliProvider {
             args.push(new_cli_session);
         }
 
-        // Add prompt as final argument
+        // Add workspace directory for tool access (must come before prompt)
+        args.push("--add-dir".to_string());
+        args.push(self.workspace.to_string_lossy().to_string());
+
+        // Enable tools for file operations (must come before prompt)
+        args.push("--tools".to_string());
+        args.push("Read,Write,Edit".to_string());
+
+        // Add prompt as final argument (must be last - --add-dir and --tools consume variadic args)
+        args.push("--".to_string());
         args.push(prompt.to_string());
 
         args
@@ -1361,6 +1372,21 @@ fn extract_system_prompt(messages: &[Message]) -> Option<String> {
 fn parse_claude_cli_output(stdout: &str) -> Result<(String, Option<String>)> {
     // Claude CLI outputs JSON with message content and session info
     if let Ok(json) = serde_json::from_str::<Value>(stdout) {
+        // Check for error responses: {"type": "result", "subtype": "error_during_execution", ...}
+        let is_error = json.get("type").and_then(|v| v.as_str()) == Some("result")
+            && json.get("subtype").and_then(|v| v.as_str()) == Some("error_during_execution");
+
+        if is_error {
+            // Extract error message from the JSON if available
+            let error_msg = json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .or_else(|| json.get("error_message").and_then(|v| v.as_str()))
+                .unwrap_or("Unknown Claude CLI error");
+            tracing::error!("Claude CLI error response: {}", error_msg);
+            return Err(anyhow::anyhow!("Claude CLI error: {}", error_msg));
+        }
+
         // Extract response text (try multiple field names)
         let text = json
             .get("result")
@@ -1368,7 +1394,16 @@ fn parse_claude_cli_output(stdout: &str) -> Result<(String, Option<String>)> {
             .or_else(|| json.get("content"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| stdout.trim().to_string());
+            .unwrap_or_else(|| {
+                // If no known field found and it looks like raw JSON, don't leak it
+                let trimmed = stdout.trim();
+                if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                    tracing::warn!("Claude CLI returned unrecognized JSON, suppressing raw output");
+                    String::new()
+                } else {
+                    trimmed.to_string()
+                }
+            });
 
         // Extract session ID (try multiple field names per OpenClaw pattern)
         let session_id = json
@@ -1580,7 +1615,7 @@ impl LLMProvider for ClaudeCliProvider {
                                                 match tool_name {
                                                     "Bash" => input.get("command")
                                                         .and_then(|v| v.as_str())
-                                                        .map(|s| if s.len() > 60 { format!("{}...", &s[..57]) } else { s.to_string() }),
+                                                        .map(|s| if s.len() > 60 { format!("{}...", crate::utils::safe_truncate(s, 57)) } else { s.to_string() }),
                                                     "Read" | "Edit" | "Write" => input.get("file_path")
                                                         .or_else(|| input.get("path"))
                                                         .and_then(|v| v.as_str())

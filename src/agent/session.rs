@@ -758,8 +758,8 @@ fn extract_match_preview(content: &str, query_lower: &str, max_len: usize) -> St
 
     if let Some(pos) = content_lower.find(query_lower) {
         let half_len = max_len / 2;
-        let start = pos.saturating_sub(half_len);
-        let end = (pos + query_lower.len() + half_len).min(content.len());
+        let start = content.floor_char_boundary(pos.saturating_sub(half_len));
+        let end = content.ceil_char_boundary((pos + query_lower.len() + half_len).min(content.len()));
 
         let slice = &content[start..end];
         let cleaned: String = slice
