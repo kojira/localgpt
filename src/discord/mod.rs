@@ -15,7 +15,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
 use crate::agent::{Agent, AgentConfig as AgentCfg};
-use crate::config::{Config, DiscordChannelConfig, NostaroConfig};
+use crate::config::{CommandsConfig, Config, DiscordChannelConfig};
 use crate::memory::MemoryManager;
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -414,17 +414,17 @@ impl DiscordBot {
             }
         }
 
-        // Execute [NOSTARO:...] tags (fire-and-forget, errors logged only)
-        Self::execute_nostaro_tags(&response, &config.nostaro).await;
+        // Execute [NOSTARO:...] and [CMD:...] tags (fire-and-forget, errors logged only)
+        Self::execute_command_tags(&response, &config.commands).await;
 
         // Remove [POST:...] sections from response text
         let post_remove_re = Regex::new(r"\[POST:\d+\]\s*[^\[]*").unwrap();
         let response_cleaned = post_remove_re.replace_all(&response, "").to_string();
 
-        // Remove [NOSTARO:...] tags from response text
-        let nostaro_remove_re =
-            Regex::new(r"\[NOSTARO:[^\]]*\]").unwrap();
-        let response_cleaned = nostaro_remove_re.replace_all(&response_cleaned, "").to_string();
+        // Remove [NOSTARO:...] and [CMD:...] tags from response text
+        let cmd_remove_re =
+            Regex::new(r"\[(NOSTARO|CMD):[^\]]*\]").unwrap();
+        let response_cleaned = cmd_remove_re.replace_all(&response_cleaned, "").to_string();
 
         // Extract [REACT:emoji] tags
         let react_re = Regex::new(r"\[REACT:([^\]]+)\]").unwrap();
@@ -1059,26 +1059,73 @@ impl DiscordBot {
             .ok_or_else(|| anyhow::anyhow!("Channel has no guild_id (DM channel?)"))
     }
 
-    /// Execute [NOSTARO:...] tags found in a response.
-    /// Commands are dynamically matched against nostaro_config.commands patterns.
-    async fn execute_nostaro_tags(response: &str, nostaro_config: &NostaroConfig) {
-        let tag_re = Regex::new(r"\[NOSTARO:([^\]]+)\]").unwrap();
+    /// Execute [NOSTARO:...] and [CMD:...] tags found in a response.
+    /// [NOSTARO:content] is a shortcut for [CMD:nostaro:content].
+    /// [CMD:group:content] dispatches to the named group.
+    /// [CMD:content] searches all groups for a matching pattern.
+    async fn execute_command_tags(response: &str, commands_config: &CommandsConfig) {
+        let tag_re = Regex::new(r"\[(NOSTARO|CMD):([^\]]+)\]").unwrap();
         for cap in tag_re.captures_iter(response) {
-            let inner = &cap[1];
-            match Self::match_nostaro_template(inner, nostaro_config) {
-                Some(cmd) => Self::run_nostaro_command(&nostaro_config.config_dir, &cmd).await,
-                None => warn!("Unknown NOSTARO tag format: {}", inner),
+            let tag_type = &cap[1];
+            let content = &cap[2];
+
+            let (group_name, tag_content) = if tag_type == "NOSTARO" {
+                // [NOSTARO:content] → group "nostaro", content as-is
+                ("nostaro".to_string(), content.to_string())
+            } else {
+                // [CMD:...] → try first segment as group name
+                let parts: Vec<&str> = content.splitn(2, ':').collect();
+                if parts.len() == 2 && commands_config.groups.contains_key(parts[0]) {
+                    (parts[0].to_string(), parts[1].to_string())
+                } else {
+                    // Search all groups for a matching pattern
+                    let mut found = None;
+                    for (gname, group) in &commands_config.groups {
+                        if Self::match_command_template(content, &group.patterns, group.binary.as_deref()).is_some() {
+                            found = Some(gname.clone());
+                            break;
+                        }
+                    }
+                    match found {
+                        Some(gname) => (gname, content.to_string()),
+                        None => {
+                            warn!("No matching CMD group for: {}", content);
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            let group = match commands_config.groups.get(&group_name) {
+                Some(g) => g,
+                None => {
+                    warn!("Unknown command group '{}' in tag: {}", group_name, content);
+                    continue;
+                }
+            };
+
+            match Self::match_command_template(&tag_content, &group.patterns, group.binary.as_deref()) {
+                Some(cmd) => Self::run_command(group.config_swap.as_deref(), &cmd).await,
+                None => warn!("Unknown command pattern in group '{}': {}", group_name, tag_content),
             }
         }
     }
 
-    /// Match tag content against configured command patterns and return the expanded command.
-    fn match_nostaro_template(tag_content: &str, config: &NostaroConfig) -> Option<String> {
+    /// Match tag content against a group's configured patterns and return the expanded command.
+    fn match_command_template(
+        tag_content: &str,
+        patterns: &HashMap<String, String>,
+        binary: Option<&str>,
+    ) -> Option<String> {
         let tag_parts: Vec<&str> = tag_content.splitn(20, ':').collect();
-        for (pattern, template) in &config.commands {
+        for (pattern, template) in patterns {
             let pattern_parts: Vec<&str> = pattern.splitn(20, ':').collect();
             if let Some(bindings) = Self::match_pattern(&pattern_parts, &tag_parts) {
-                let mut result = template.replace("{binary}", &config.binary);
+                let mut result = if let Some(bin) = binary {
+                    template.replace("{binary}", bin)
+                } else {
+                    template.clone()
+                };
                 for (key, value) in &bindings {
                     result = result.replace(&format!("{{{}}}", key), value);
                 }
@@ -1117,86 +1164,118 @@ impl DiscordBot {
         Some(bindings)
     }
 
-    /// Run a nostaro command with config swap:
-    /// 1. Backup ~/.nostaro/config.toml if it exists
-    /// 2. Copy config_dir/config.toml → ~/.nostaro/config.toml
-    /// 3. Execute command via sh -c
-    /// 4. Restore original or remove copied file
-    async fn run_nostaro_command(config_dir: &str, command: &str) {
-        let config_dir_expanded = shellexpand::tilde(config_dir).to_string();
-        let nostaro_dir = shellexpand::tilde("~/.nostaro").to_string();
-        let target_config = format!("{}/config.toml", nostaro_dir);
-        let source_config = format!("{}/config.toml", config_dir_expanded);
+    /// Run a command, optionally with config swap.
+    /// If config_swap is Some(dir):
+    ///   1. Backup ~/.nostaro/config.toml if it exists
+    ///   2. Copy dir/config.toml → ~/.nostaro/config.toml
+    ///   3. Execute command via sh -c
+    ///   4. Restore original or remove copied file
+    /// If config_swap is None, just execute the command directly.
+    async fn run_command(config_swap: Option<&str>, command: &str) {
+        if let Some(config_dir) = config_swap {
+            let config_dir_expanded = shellexpand::tilde(config_dir).to_string();
+            let nostaro_dir = shellexpand::tilde("~/.nostaro").to_string();
+            let target_config = format!("{}/config.toml", nostaro_dir);
+            let source_config = format!("{}/config.toml", config_dir_expanded);
 
-        // Check if source config exists
-        if !tokio::fs::metadata(&source_config).await.is_ok() {
-            error!("NOSTARO source config not found: {}", source_config);
-            return;
-        }
-
-        // Ensure ~/.nostaro directory exists
-        if let Err(e) = tokio::fs::create_dir_all(&nostaro_dir).await {
-            error!("Failed to create nostaro dir {}: {}", nostaro_dir, e);
-            return;
-        }
-
-        // Check if original config exists (for backup/restore)
-        let original_exists = tokio::fs::metadata(&target_config).await.is_ok();
-        let backup_path = format!("{}.localgpt-backup", target_config);
-
-        // Backup original if it exists
-        if original_exists {
-            if let Err(e) = tokio::fs::copy(&target_config, &backup_path).await {
-                error!("Failed to backup nostaro config: {}", e);
+            // Check if source config exists
+            if !tokio::fs::metadata(&source_config).await.is_ok() {
+                error!("Config swap source not found: {}", source_config);
                 return;
             }
-        }
 
-        // Copy source config to target
-        if let Err(e) = tokio::fs::copy(&source_config, &target_config).await {
-            error!("Failed to copy nostaro config: {}", e);
-            if original_exists {
-                let _ = tokio::fs::rename(&backup_path, &target_config).await;
+            // Ensure ~/.nostaro directory exists
+            if let Err(e) = tokio::fs::create_dir_all(&nostaro_dir).await {
+                error!("Failed to create dir {}: {}", nostaro_dir, e);
+                return;
             }
-            return;
-        }
 
-        info!("Executing nostaro: {}", command);
+            // Check if original config exists (for backup/restore)
+            let original_exists = tokio::fs::metadata(&target_config).await.is_ok();
+            let backup_path = format!("{}.localgpt-backup", target_config);
 
-        // Execute command via shell
-        let result = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .output()
-            .await;
-
-        match result {
-            Ok(output) => {
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    info!("NOSTARO success: {}", stdout.trim());
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    error!(
-                        "NOSTARO command failed (exit {}): {}",
-                        output.status,
-                        stderr.trim()
-                    );
+            // Backup original if it exists
+            if original_exists {
+                if let Err(e) = tokio::fs::copy(&target_config, &backup_path).await {
+                    error!("Failed to backup config: {}", e);
+                    return;
                 }
             }
-            Err(e) => {
-                error!("Failed to execute nostaro command: {}", e);
-            }
-        }
 
-        // Restore original config or remove copied file
-        if original_exists {
-            if let Err(e) = tokio::fs::rename(&backup_path, &target_config).await {
-                error!("Failed to restore nostaro config backup: {}", e);
+            // Copy source config to target
+            if let Err(e) = tokio::fs::copy(&source_config, &target_config).await {
+                error!("Failed to copy config: {}", e);
+                if original_exists {
+                    let _ = tokio::fs::rename(&backup_path, &target_config).await;
+                }
+                return;
+            }
+
+            info!("Executing command (config swap): {}", command);
+
+            // Execute command via shell
+            let result = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .output()
+                .await;
+
+            match result {
+                Ok(output) => {
+                    if output.status.success() {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        info!("Command success: {}", stdout.trim());
+                    } else {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        error!(
+                            "Command failed (exit {}): {}",
+                            output.status,
+                            stderr.trim()
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to execute command: {}", e);
+                }
+            }
+
+            // Restore original config or remove copied file
+            if original_exists {
+                if let Err(e) = tokio::fs::rename(&backup_path, &target_config).await {
+                    error!("Failed to restore config backup: {}", e);
+                }
+            } else {
+                if let Err(e) = tokio::fs::remove_file(&target_config).await {
+                    error!("Failed to remove swapped config: {}", e);
+                }
             }
         } else {
-            if let Err(e) = tokio::fs::remove_file(&target_config).await {
-                error!("Failed to remove nostaro config: {}", e);
+            // No config swap — just execute directly
+            info!("Executing command: {}", command);
+
+            let result = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .output()
+                .await;
+
+            match result {
+                Ok(output) => {
+                    if output.status.success() {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        info!("Command success: {}", stdout.trim());
+                    } else {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        error!(
+                            "Command failed (exit {}): {}",
+                            output.status,
+                            stderr.trim()
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to execute command: {}", e);
+                }
             }
         }
     }

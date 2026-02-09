@@ -37,7 +37,7 @@ pub struct Config {
     pub channels: ChannelsConfig,
 
     #[serde(default)]
-    pub nostaro: NostaroConfig,
+    pub commands: CommandsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,40 +262,20 @@ pub struct DiscordGuildConfig {
     pub require_mention: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommandsConfig {
+    #[serde(flatten)]
+    pub groups: HashMap<String, CommandGroupConfig>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NostaroConfig {
-    #[serde(default = "default_nostaro_binary")]
-    pub binary: String,
-    #[serde(default = "default_nostaro_config_dir")]
-    pub config_dir: String,
-    #[serde(default = "default_nostaro_commands")]
-    pub commands: HashMap<String, String>,
-}
-
-impl Default for NostaroConfig {
-    fn default() -> Self {
-        NostaroConfig {
-            binary: default_nostaro_binary(),
-            config_dir: default_nostaro_config_dir(),
-            commands: default_nostaro_commands(),
-        }
-    }
-}
-
-fn default_nostaro_binary() -> String {
-    "/Users/kojira/.openclaw/workspace/projects/nostaro/target/release/nostaro".to_string()
-}
-fn default_nostaro_config_dir() -> String {
-    "~/.nostaro-howari".to_string()
-}
-fn default_nostaro_commands() -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert("post:{message}".to_string(), "{binary} post \"{message}\"".to_string());
-    m.insert("reply:{note_id}:{message}".to_string(), "{binary} reply {note_id} \"{message}\"".to_string());
-    m.insert("react:{note_id}:{emoji}".to_string(), "{binary} react {note_id} --content \"{emoji}\"".to_string());
-    m.insert("channel:post:{channel_id}:{message}".to_string(), "{binary} channel post {channel_id} \"{message}\"".to_string());
-    m.insert("channel:create:{name}:{about}".to_string(), "{binary} channel create --name \"{name}\" --about \"{about}\"".to_string());
-    m
+pub struct CommandGroupConfig {
+    #[serde(default)]
+    pub config_swap: Option<String>,
+    #[serde(default)]
+    pub binary: Option<String>,
+    #[serde(default)]
+    pub patterns: HashMap<String, String>,
 }
 
 // Default value functions
