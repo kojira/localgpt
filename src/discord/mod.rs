@@ -15,7 +15,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
 use crate::agent::{Agent, AgentConfig as AgentCfg};
-use crate::config::{CommandsConfig, Config, DiscordChannelConfig};
+use crate::config::{CmdConfig, Config, DiscordChannelConfig, NostaroConfig};
 use crate::memory::MemoryManager;
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -415,7 +415,7 @@ impl DiscordBot {
         }
 
         // Execute [NOSTARO:...] and [CMD:...] tags (fire-and-forget, errors logged only)
-        Self::execute_command_tags(&response, &config.commands).await;
+        Self::execute_command_tags(&response, &config.nostaro, &config.cmd).await;
 
         // Remove [POST:...] sections from response text
         let post_remove_re = Regex::new(r"\[POST:\d+\]\s*[^\[]*").unwrap();
@@ -1060,53 +1060,22 @@ impl DiscordBot {
     }
 
     /// Execute [NOSTARO:...] and [CMD:...] tags found in a response.
-    /// [NOSTARO:content] is a shortcut for [CMD:nostaro:content].
-    /// [CMD:group:content] dispatches to the named group.
-    /// [CMD:content] searches all groups for a matching pattern.
-    async fn execute_command_tags(response: &str, commands_config: &CommandsConfig) {
+    async fn execute_command_tags(response: &str, nostaro_config: &NostaroConfig, cmd_config: &CmdConfig) {
         let tag_re = Regex::new(r"\[(NOSTARO|CMD):([^\]]+)\]").unwrap();
         for cap in tag_re.captures_iter(response) {
             let tag_type = &cap[1];
             let content = &cap[2];
 
-            let (group_name, tag_content) = if tag_type == "NOSTARO" {
-                // [NOSTARO:content] → group "nostaro", content as-is
-                ("nostaro".to_string(), content.to_string())
+            if tag_type == "NOSTARO" {
+                match Self::match_command_template(content, &nostaro_config.commands, Some(&nostaro_config.binary)) {
+                    Some(cmd) => Self::run_command(Some(&nostaro_config.config_dir), &cmd).await,
+                    None => warn!("Unknown NOSTARO command: {}", content),
+                }
             } else {
-                // [CMD:...] → try first segment as group name
-                let parts: Vec<&str> = content.splitn(2, ':').collect();
-                if parts.len() == 2 && commands_config.groups.contains_key(parts[0]) {
-                    (parts[0].to_string(), parts[1].to_string())
-                } else {
-                    // Search all groups for a matching pattern
-                    let mut found = None;
-                    for (gname, group) in &commands_config.groups {
-                        if Self::match_command_template(content, &group.patterns, group.binary.as_deref()).is_some() {
-                            found = Some(gname.clone());
-                            break;
-                        }
-                    }
-                    match found {
-                        Some(gname) => (gname, content.to_string()),
-                        None => {
-                            warn!("No matching CMD group for: {}", content);
-                            continue;
-                        }
-                    }
+                match Self::match_command_template(content, &cmd_config.commands, None) {
+                    Some(cmd) => Self::run_command(None, &cmd).await,
+                    None => warn!("Unknown CMD command: {}", content),
                 }
-            };
-
-            let group = match commands_config.groups.get(&group_name) {
-                Some(g) => g,
-                None => {
-                    warn!("Unknown command group '{}' in tag: {}", group_name, content);
-                    continue;
-                }
-            };
-
-            match Self::match_command_template(&tag_content, &group.patterns, group.binary.as_deref()) {
-                Some(cmd) => Self::run_command(group.config_swap.as_deref(), &cmd).await,
-                None => warn!("Unknown command pattern in group '{}': {}", group_name, tag_content),
             }
         }
     }

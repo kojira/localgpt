@@ -37,7 +37,10 @@ pub struct Config {
     pub channels: ChannelsConfig,
 
     #[serde(default)]
-    pub commands: CommandsConfig,
+    pub nostaro: NostaroConfig,
+
+    #[serde(default)]
+    pub cmd: CmdConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,20 +265,37 @@ pub struct DiscordGuildConfig {
     pub require_mention: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CommandsConfig {
-    #[serde(flatten)]
-    pub groups: HashMap<String, CommandGroupConfig>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NostaroConfig {
+    #[serde(default = "default_nostaro_binary")]
+    pub binary: String,
+    #[serde(default = "default_nostaro_config_dir")]
+    pub config_dir: String,
+    #[serde(default)]
+    pub commands: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommandGroupConfig {
+impl Default for NostaroConfig {
+    fn default() -> Self {
+        NostaroConfig {
+            binary: default_nostaro_binary(),
+            config_dir: default_nostaro_config_dir(),
+            commands: HashMap::new(),
+        }
+    }
+}
+
+fn default_nostaro_binary() -> String {
+    "/Users/kojira/.openclaw/workspace/projects/nostaro/target/release/nostaro".to_string()
+}
+fn default_nostaro_config_dir() -> String {
+    "~/.nostaro-howari".to_string()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CmdConfig {
     #[serde(default)]
-    pub config_swap: Option<String>,
-    #[serde(default)]
-    pub binary: Option<String>,
-    #[serde(default)]
-    pub patterns: HashMap<String, String>,
+    pub commands: HashMap<String, String>,
 }
 
 // Default value functions
