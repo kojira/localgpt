@@ -257,16 +257,26 @@ impl DiscordBot {
                 }
             }
 
-            info!("Processing batch of {} message(s)", batch.len());
-            Self::process_batch(
-                &batch,
-                &config,
-                &http,
-                &token,
-                &last_error_sent,
-                Arc::clone(&agents),
-            )
-            .await;
+            info!("Collected batch of {} message(s)", batch.len());
+
+            // Group messages by channel_id to prevent cross-channel mixing
+            let mut by_channel: HashMap<String, Vec<QueuedMessage>> = HashMap::new();
+            for msg in batch {
+                by_channel.entry(msg.channel_id.clone()).or_default().push(msg);
+            }
+
+            for (chan_id, channel_batch) in &by_channel {
+                info!("Processing {} message(s) for channel {}", channel_batch.len(), chan_id);
+                Self::process_batch(
+                    channel_batch,
+                    &config,
+                    &http,
+                    &token,
+                    &last_error_sent,
+                    Arc::clone(&agents),
+                )
+                .await;
+            }
         }
         info!("Queue processor shutting down (channel closed)");
     }
