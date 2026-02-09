@@ -430,6 +430,9 @@ struct SessionInfo {
     session_id: String,
     idle_seconds: u64,
     source: String,
+    token_count: usize,
+    api_input_tokens: u64,
+    api_output_tokens: u64,
 }
 
 #[derive(Serialize)]
@@ -442,21 +445,31 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<ListSessionsR
 
     let mut session_list: Vec<SessionInfo> = sessions
         .iter()
-        .map(|(id, entry)| SessionInfo {
-            session_id: id.clone(),
-            idle_seconds: entry.last_accessed.elapsed().as_secs(),
-            source: "http".to_string(),
+        .map(|(id, entry)| {
+            let status = entry.agent.session_status();
+            SessionInfo {
+                session_id: id.clone(),
+                idle_seconds: entry.last_accessed.elapsed().as_secs(),
+                source: "http".to_string(),
+                token_count: status.token_count,
+                api_input_tokens: status.api_input_tokens,
+                api_output_tokens: status.api_output_tokens,
+            }
         })
         .collect();
 
     // Include Discord sessions if available (try_lock to avoid deadlock)
     if let Some(ref discord_agents) = state.discord_agents {
         if let Ok(agents) = discord_agents.try_lock() {
-            for channel_id in agents.keys() {
+            for (channel_id, agent) in agents.iter() {
+                let status = agent.session_status();
                 session_list.push(SessionInfo {
                     session_id: format!("discord-{}", channel_id),
                     idle_seconds: 0,
                     source: "discord".to_string(),
+                    token_count: status.token_count,
+                    api_input_tokens: status.api_input_tokens,
+                    api_output_tokens: status.api_output_tokens,
                 });
             }
         }
