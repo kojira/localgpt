@@ -15,7 +15,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
 use crate::agent::{Agent, AgentConfig as AgentCfg};
-use crate::config::{CmdConfig, Config, DiscordChannelConfig, NostaroConfig};
+use crate::config::{Config, DiscordChannelConfig, TagGroup};
 use crate::memory::MemoryManager;
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -414,17 +414,22 @@ impl DiscordBot {
             }
         }
 
-        // Execute [NOSTARO:...] and [CMD:...] tags (fire-and-forget, errors logged only)
-        Self::execute_command_tags(&response, &config.nostaro, &config.cmd).await;
+        // Execute command tags (fire-and-forget, errors logged only)
+        Self::execute_command_tags(&response, &config.tags).await;
 
         // Remove [POST:...] sections from response text
         let post_remove_re = Regex::new(r"\[POST:\d+\]\s*[^\[]*").unwrap();
         let response_cleaned = post_remove_re.replace_all(&response, "").to_string();
 
-        // Remove [NOSTARO:...] and [CMD:...] tags from response text
-        let cmd_remove_re =
-            Regex::new(r"\[(NOSTARO|CMD):[^\]]*\]").unwrap();
-        let response_cleaned = cmd_remove_re.replace_all(&response_cleaned, "").to_string();
+        // Remove command tags from response text
+        let tag_names: Vec<String> = config.tags.keys().map(|k| k.to_uppercase()).collect();
+        let response_cleaned = if tag_names.is_empty() {
+            response_cleaned
+        } else {
+            let tag_remove_pattern = format!(r"\[({}):([^\]]*)\]", tag_names.join("|"));
+            let tag_remove_re = Regex::new(&tag_remove_pattern).unwrap();
+            tag_remove_re.replace_all(&response_cleaned, "").to_string()
+        };
 
         // Extract [REACT:emoji] tags
         let react_re = Regex::new(r"\[REACT:([^\]]+)\]").unwrap();
@@ -1059,23 +1064,28 @@ impl DiscordBot {
             .ok_or_else(|| anyhow::anyhow!("Channel has no guild_id (DM channel?)"))
     }
 
-    /// Execute [NOSTARO:...] and [CMD:...] tags found in a response.
-    async fn execute_command_tags(response: &str, nostaro_config: &NostaroConfig, cmd_config: &CmdConfig) {
-        let tag_re = Regex::new(r"\[(NOSTARO|CMD):([^\]]+)\]").unwrap();
+    /// Execute command tags found in a response. Tag names come from config HashMap keys.
+    async fn execute_command_tags(response: &str, tags: &HashMap<String, TagGroup>) {
+        if tags.is_empty() {
+            return;
+        }
+        // Build regex from config tag keys (uppercased)
+        let names: Vec<String> = tags.keys().map(|k| k.to_uppercase()).collect();
+        let pattern = format!(r"\[({}):([^\]]+)\]", names.join("|"));
+        let tag_re = Regex::new(&pattern).unwrap();
+
         for cap in tag_re.captures_iter(response) {
-            let tag_type = &cap[1];
+            let tag_name = &cap[1];
             let content = &cap[2];
 
-            if tag_type == "NOSTARO" {
-                match Self::match_command_template(content, &nostaro_config.commands, Some(&nostaro_config.binary)) {
-                    Some(cmd) => Self::run_command(Some(&nostaro_config.config_dir), &cmd).await,
-                    None => warn!("Unknown NOSTARO command: {}", content),
-                }
-            } else {
-                match Self::match_command_template(content, &cmd_config.commands, None) {
-                    Some(cmd) => Self::run_command(None, &cmd).await,
-                    None => warn!("Unknown CMD command: {}", content),
-                }
+            let group = match tags.get(&tag_name.to_lowercase()) {
+                Some(g) => g,
+                None => continue,
+            };
+
+            match Self::match_command_template(content, &group.patterns, group.binary.as_deref()) {
+                Some(cmd) => Self::run_command(group.config_swap.as_deref(), &cmd).await,
+                None => warn!("Unknown {} command: {}", tag_name, content),
             }
         }
     }
