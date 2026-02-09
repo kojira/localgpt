@@ -15,7 +15,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
 use crate::agent::{Agent, AgentConfig as AgentCfg};
-use crate::config::{Config, DiscordChannelConfig};
+use crate::config::{Config, DiscordChannelConfig, TagGroup};
 use crate::memory::MemoryManager;
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -414,9 +414,22 @@ impl DiscordBot {
             }
         }
 
+        // Execute command tags (fire-and-forget, errors logged only)
+        Self::execute_command_tags(&response, &config.tags).await;
+
         // Remove [POST:...] sections from response text
         let post_remove_re = Regex::new(r"\[POST:\d+\]\s*[^\[]*").unwrap();
         let response_cleaned = post_remove_re.replace_all(&response, "").to_string();
+
+        // Remove command tags from response text
+        let tag_names: Vec<String> = config.tags.keys().map(|k| k.to_uppercase()).collect();
+        let response_cleaned = if tag_names.is_empty() {
+            response_cleaned
+        } else {
+            let tag_remove_pattern = format!(r"\[({}):([^\]]*)\]", tag_names.join("|"));
+            let tag_remove_re = Regex::new(&tag_remove_pattern).unwrap();
+            tag_remove_re.replace_all(&response_cleaned, "").to_string()
+        };
 
         // Extract [REACT:emoji] tags
         let react_re = Regex::new(r"\[REACT:([^\]]+)\]").unwrap();
@@ -1049,6 +1062,201 @@ impl DiscordBot {
         let info: ChannelDetail = resp.json().await?;
         info.guild_id
             .ok_or_else(|| anyhow::anyhow!("Channel has no guild_id (DM channel?)"))
+    }
+
+    /// Execute command tags found in a response. Tag names come from config HashMap keys.
+    async fn execute_command_tags(response: &str, tags: &HashMap<String, TagGroup>) {
+        if tags.is_empty() {
+            return;
+        }
+        // Build regex from config tag keys (uppercased)
+        let names: Vec<String> = tags.keys().map(|k| k.to_uppercase()).collect();
+        let pattern = format!(r"\[({}):([^\]]+)\]", names.join("|"));
+        let tag_re = Regex::new(&pattern).unwrap();
+
+        for cap in tag_re.captures_iter(response) {
+            let tag_name = &cap[1];
+            let content = &cap[2];
+
+            let group = match tags.get(&tag_name.to_lowercase()) {
+                Some(g) => g,
+                None => continue,
+            };
+
+            match Self::match_command_template(content, &group.patterns, group.binary.as_deref()) {
+                Some(cmd) => Self::run_command(group.config_swap.as_deref(), &cmd).await,
+                None => warn!("Unknown {} command: {}", tag_name, content),
+            }
+        }
+    }
+
+    /// Match tag content against a group's configured patterns and return the expanded command.
+    fn match_command_template(
+        tag_content: &str,
+        patterns: &HashMap<String, String>,
+        binary: Option<&str>,
+    ) -> Option<String> {
+        let tag_parts: Vec<&str> = tag_content.splitn(20, ':').collect();
+        for (pattern, template) in patterns {
+            let pattern_parts: Vec<&str> = pattern.splitn(20, ':').collect();
+            if let Some(bindings) = Self::match_pattern(&pattern_parts, &tag_parts) {
+                let mut result = if let Some(bin) = binary {
+                    template.replace("{binary}", bin)
+                } else {
+                    template.clone()
+                };
+                for (key, value) in &bindings {
+                    result = result.replace(&format!("{{{}}}", key), value);
+                }
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    /// Try to match tag parts against a pattern. Returns bound placeholders on success.
+    /// The last placeholder in a pattern greedily captures all remaining segments.
+    fn match_pattern(pattern_parts: &[&str], tag_parts: &[&str]) -> Option<Vec<(String, String)>> {
+        if tag_parts.len() < pattern_parts.len() {
+            return None;
+        }
+        let mut bindings = Vec::new();
+        let mut tag_idx = 0;
+        for (i, pp) in pattern_parts.iter().enumerate() {
+            if tag_idx >= tag_parts.len() {
+                return None;
+            }
+            if pp.starts_with('{') && pp.ends_with('}') {
+                let key = &pp[1..pp.len() - 1];
+                if i == pattern_parts.len() - 1 {
+                    // Last placeholder captures all remaining segments
+                    let remaining = tag_parts[tag_idx..].join(":");
+                    bindings.push((key.to_string(), remaining));
+                } else {
+                    bindings.push((key.to_string(), tag_parts[tag_idx].to_string()));
+                }
+            } else if tag_parts[tag_idx] != *pp {
+                return None;
+            }
+            tag_idx += 1;
+        }
+        Some(bindings)
+    }
+
+    /// Run a command, optionally with config swap.
+    /// If config_swap is Some(dir):
+    ///   1. Backup ~/.nostaro/config.toml if it exists
+    ///   2. Copy dir/config.toml → ~/.nostaro/config.toml
+    ///   3. Execute command via sh -c
+    ///   4. Restore original or remove copied file
+    /// If config_swap is None, just execute the command directly.
+    async fn run_command(config_swap: Option<&str>, command: &str) {
+        if let Some(config_dir) = config_swap {
+            let config_dir_expanded = shellexpand::tilde(config_dir).to_string();
+            let nostaro_dir = shellexpand::tilde("~/.nostaro").to_string();
+            let target_config = format!("{}/config.toml", nostaro_dir);
+            let source_config = format!("{}/config.toml", config_dir_expanded);
+
+            // Check if source config exists
+            if !tokio::fs::metadata(&source_config).await.is_ok() {
+                error!("Config swap source not found: {}", source_config);
+                return;
+            }
+
+            // Ensure ~/.nostaro directory exists
+            if let Err(e) = tokio::fs::create_dir_all(&nostaro_dir).await {
+                error!("Failed to create dir {}: {}", nostaro_dir, e);
+                return;
+            }
+
+            // Check if original config exists (for backup/restore)
+            let original_exists = tokio::fs::metadata(&target_config).await.is_ok();
+            let backup_path = format!("{}.localgpt-backup", target_config);
+
+            // Backup original if it exists
+            if original_exists {
+                if let Err(e) = tokio::fs::copy(&target_config, &backup_path).await {
+                    error!("Failed to backup config: {}", e);
+                    return;
+                }
+            }
+
+            // Copy source config to target
+            if let Err(e) = tokio::fs::copy(&source_config, &target_config).await {
+                error!("Failed to copy config: {}", e);
+                if original_exists {
+                    let _ = tokio::fs::rename(&backup_path, &target_config).await;
+                }
+                return;
+            }
+
+            info!("Executing command (config swap): {}", command);
+
+            // Execute command via shell
+            let result = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .output()
+                .await;
+
+            match result {
+                Ok(output) => {
+                    if output.status.success() {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        info!("Command success: {}", stdout.trim());
+                    } else {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        error!(
+                            "Command failed (exit {}): {}",
+                            output.status,
+                            stderr.trim()
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to execute command: {}", e);
+                }
+            }
+
+            // Restore original config or remove copied file
+            if original_exists {
+                if let Err(e) = tokio::fs::rename(&backup_path, &target_config).await {
+                    error!("Failed to restore config backup: {}", e);
+                }
+            } else {
+                if let Err(e) = tokio::fs::remove_file(&target_config).await {
+                    error!("Failed to remove swapped config: {}", e);
+                }
+            }
+        } else {
+            // No config swap — just execute directly
+            info!("Executing command: {}", command);
+
+            let result = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .output()
+                .await;
+
+            match result {
+                Ok(output) => {
+                    if output.status.success() {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        info!("Command success: {}", stdout.trim());
+                    } else {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        error!(
+                            "Command failed (exit {}): {}",
+                            output.status,
+                            stderr.trim()
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to execute command: {}", e);
+                }
+            }
+        }
     }
 
     /// Execute [LIST:...] and [READ:...] tool tags found in a response.

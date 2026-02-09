@@ -6,6 +6,7 @@ pub use schema::*;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -34,6 +35,9 @@ pub struct Config {
 
     #[serde(default)]
     pub channels: ChannelsConfig,
+
+    #[serde(default)]
+    pub tags: HashMap<String, TagGroup>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,6 +260,16 @@ pub struct DiscordGuildConfig {
     /// Whether the bot must be @mentioned to respond
     #[serde(default)]
     pub require_mention: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagGroup {
+    #[serde(default)]
+    pub binary: Option<String>,
+    #[serde(default)]
+    pub config_swap: Option<String>,
+    #[serde(default)]
+    pub patterns: HashMap<String, String>,
 }
 
 // Default value functions
