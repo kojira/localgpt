@@ -13,6 +13,7 @@ A local device focused AI assistant built in Rust — persistent memory, autonom
 - **Autonomous heartbeat** — delegate tasks and let it work in the background
 - **Multiple interfaces** — CLI, web UI, desktop GUI
 - **Multiple LLM providers** — Anthropic (Claude), OpenAI, Ollama
+- **Plugin Tags** — config-driven tag system for executing external commands from LLM responses
 - **OpenClaw compatible** — works with SOUL, MEMORY, HEARTBEAT markdown files and skills format
 
 ## Install
@@ -127,6 +128,81 @@ Rust, Tokio, Axum, SQLite (FTS5 + sqlite-vec), fastembed, eframe
 ## Stargazers
 
 [![Star History Chart](https://api.star-history.com/svg?repos=localgpt-app/localgpt&type=Date)](https://star-history.com/#localgpt-app/localgpt&Date)
+
+## Plugin Tags（プラグインタグシステム）
+
+LLMの応答テキストにタグを埋め込むだけで外部コマンドを実行できる、config駆動の軽量プラグインシステム。
+
+### 特徴
+
+- タグ名・コマンドパターン・テンプレートすべてconfig.tomlで定義
+- Rustコード変更不要で新しいタグを追加可能
+- ツールコール不要 → トークン消費を大幅削減
+- オプショナルなconfig差し替え機能（複数アカウント切替等に対応）
+
+### 仕組み
+
+1. LLMが応答に `[TAG_NAME:引数1:引数2...]` を含める
+2. LocalGPTが後処理でタグを検出・パース
+3. config.tomlのテンプレートに基づいてコマンド生成・実行
+4. タグはDiscord送信前にテキストから除去される
+
+### Configuration
+
+Add to `~/.localgpt/config.toml`:
+
+```toml
+[tags.nostaro]
+binary = "/path/to/nostaro"
+config_swap = "~/.nostaro-howari"  # Optional: swap config before execution
+
+[tags.nostaro.patterns]
+"post:{message}" = "{binary} post \"{message}\""
+"reply:{note_id}:{message}" = "{binary} reply {note_id} \"{message}\""
+"react:{note_id}:{emoji}" = "{binary} react {note_id} --content \"{emoji}\""
+"channel:post:{channel_id}:{message}" = "{binary} channel post {channel_id} \"{message}\""
+"channel:create:{name}:{about}" = "{binary} channel create --name \"{name}\" --about \"{about}\""
+
+[tags.cmd]
+[tags.cmd.patterns]
+"ls:{path}" = "ls {path}"
+"echo:{message}" = "echo \"{message}\""
+```
+
+### Use Cases
+
+**Nostr posting** — Agent posts to Nostr while chatting on Discord:
+- `[NOSTARO:post:おはよう☁️]` → Post to Nostr via nostaro
+- `[NOSTARO:react:note1xxx:⚡]` → React on Nostr
+
+**Shell commands** — Execute system commands alongside responses:
+- `[CMD:echo:ログメッセージ]` → Run echo command
+- `[CMD:ls:/home]` → List directory
+
+**Multi-account** — `config_swap` auto-switches between different account configs
+
+**Weather** —
+```toml
+[tags.weather]
+[tags.weather.patterns]
+"{city}" = "curl -s wttr.in/{city}?format=3"
+```
+`[WEATHER:Tokyo]` → Fetch weather info
+
+**Token savings** — No round-trip needed unlike tool calls:
+- Tool call: prompt → tool decision → execute → result → final answer (2x input tokens)
+- Tag system: prompt → answer+tag → post-process (1x input tokens)
+
+### Template Syntax
+
+- `{binary}` → Replaced with TagGroup's binary field
+- `{placeholder}` → Replaced with pattern-matched value
+- Last placeholder captures all remaining segments (supports strings with colons)
+
+### Security Notes
+
+- Only specify trusted directories for `config_swap`
+- Only define safe commands in `patterns` — LLM can trigger any defined pattern
 
 ## Discord Integration
 
