@@ -14,7 +14,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
-use crate::agent::{Agent, AgentConfig as AgentCfg};
+use base64::Engine;
+use crate::agent::{Agent, AgentConfig as AgentCfg, ImageAttachment};
 use crate::config::{Config, DiscordChannelConfig, TagGroup};
 use crate::memory::MemoryManager;
 
@@ -79,6 +80,18 @@ struct MessageCreateData {
     content: String,
     author: MessageAuthor,
     mentions: Option<Vec<MentionUser>>,
+    #[serde(default)]
+    attachments: Vec<DiscordAttachment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordAttachment {
+    #[allow(dead_code)]
+    id: String,
+    url: String,
+    content_type: Option<String>,
+    #[allow(dead_code)]
+    filename: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +137,7 @@ struct QueuedMessage {
     message_id: String,
     author_name: String,
     content: String,
+    image_urls: Vec<String>,
 }
 
 // ─── Discord bot ────────────────────────────────────────────────────
@@ -309,6 +323,40 @@ impl DiscordBot {
                 .join("\n")
         };
 
+        // Collect all image URLs from the batch
+        let all_image_urls: Vec<String> = batch
+            .iter()
+            .flat_map(|m| m.image_urls.iter().cloned())
+            .collect();
+
+        // Download and encode images
+        let mut images: Vec<ImageAttachment> = Vec::new();
+        for url in &all_image_urls {
+            match http.get(url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let content_type = resp
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("image/png")
+                        .to_string();
+                    match resp.bytes().await {
+                        Ok(bytes) => {
+                            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            images.push(ImageAttachment {
+                                data,
+                                media_type: content_type,
+                            });
+                            info!("Downloaded image attachment ({} bytes)", bytes.len());
+                        }
+                        Err(e) => warn!("Failed to read image bytes from {}: {}", url, e),
+                    }
+                }
+                Ok(resp) => warn!("Failed to download image {}: HTTP {}", url, resp.status()),
+                Err(e) => warn!("Failed to download image {}: {}", url, e),
+            }
+        }
+
         // Send typing indicator
         let _ = Self::send_typing_static(http, token, channel_id).await;
 
@@ -317,6 +365,7 @@ impl DiscordBot {
         let config_clone = config.clone();
         let combined = combined_content.clone();
         let agents_init = Arc::clone(&agents);
+        let batch_images = images;
 
         let result = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
@@ -354,7 +403,7 @@ impl DiscordBot {
                     }
                 }
 
-                agent.chat(&combined).await
+                agent.chat_with_images(&combined, batch_images).await
             })
         })
         .await;
@@ -484,7 +533,7 @@ impl DiscordBot {
                     }
                 );
                 if let Err(e) =
-                    Self::send_message_static(http, token, target_channel, post_msg).await
+                    Self::send_message_static(http, token, target_channel, post_msg, None).await
                 {
                     error!("Failed to cross-post to channel {}: {}", target_channel, e);
                 }
@@ -533,10 +582,22 @@ impl DiscordBot {
                         error!("Failed to add emoji-only reaction {}: {}", first_emoji, e);
                     }
                 }
-            } else if let Err(e) =
-                Self::send_message_static(http, token, channel_id, &text).await
-            {
-                error!("Failed to send Discord message: {}", e);
+            } else {
+                // Detect image URLs in the response text for embeds
+                let img_url_re = Regex::new(
+                    r"https://\S+\.(?:png|jpg|jpeg|gif|webp)"
+                ).unwrap();
+                let embeds: Vec<serde_json::Value> = img_url_re
+                    .find_iter(&text)
+                    .map(|m| serde_json::json!({"image": {"url": m.as_str()}}))
+                    .collect();
+                let embeds_opt = if embeds.is_empty() { None } else { Some(embeds) };
+
+                if let Err(e) =
+                    Self::send_message_static(http, token, channel_id, &text, embeds_opt).await
+                {
+                    error!("Failed to send Discord message: {}", e);
+                }
             }
         }
     }
@@ -821,9 +882,22 @@ impl DiscordBot {
             }
         }
 
-        // Skip empty messages
+        // Collect image attachment URLs
+        let image_urls: Vec<String> = msg
+            .attachments
+            .iter()
+            .filter(|a| {
+                a.content_type
+                    .as_deref()
+                    .map(|ct| ct.starts_with("image/"))
+                    .unwrap_or(false)
+            })
+            .map(|a| a.url.clone())
+            .collect();
+
+        // Skip empty messages (no text and no images)
         let content = msg.content.trim();
-        if content.is_empty() {
+        if content.is_empty() && image_urls.is_empty() {
             return;
         }
 
@@ -831,7 +905,7 @@ impl DiscordBot {
         let cleaned = self.strip_mention(content, state);
 
         info!(
-            "Message from {} in channel {}: {}",
+            "Message from {} in channel {}: {}{}",
             msg.author.username,
             msg.channel_id,
             if cleaned.len() > 80 {
@@ -839,6 +913,11 @@ impl DiscordBot {
                 format!("{}...", truncated)
             } else {
                 cleaned.clone()
+            },
+            if image_urls.is_empty() {
+                String::new()
+            } else {
+                format!(" [+{} image(s)]", image_urls.len())
             }
         );
 
@@ -848,6 +927,7 @@ impl DiscordBot {
             message_id: msg.id.clone(),
             author_name: msg.author.username.clone(),
             content: cleaned,
+            image_urls,
         };
 
         match self.queue_tx.try_send(queued) {
@@ -900,6 +980,7 @@ impl DiscordBot {
                 token,
                 channel_id,
                 "Sorry, I encountered an error.",
+                None,
             )
             .await;
         } else {
@@ -946,16 +1027,27 @@ impl DiscordBot {
         token: &str,
         channel_id: &str,
         content: &str,
+        embeds: Option<Vec<serde_json::Value>>,
     ) -> Result<()> {
         // Discord message limit is 2000 characters; split if needed
         let chunks = split_message(content, 2000);
 
-        for chunk in chunks {
+        for (i, chunk) in chunks.iter().enumerate() {
             let url = format!("{}/channels/{}/messages", DISCORD_API_BASE, channel_id);
+            // Attach embeds only to the last chunk
+            let body = if i == chunks.len() - 1 {
+                if let Some(ref embeds) = embeds {
+                    serde_json::json!({"content": chunk, "embeds": embeds})
+                } else {
+                    serde_json::json!({"content": chunk})
+                }
+            } else {
+                serde_json::json!({"content": chunk})
+            };
             let resp = http
                 .post(&url)
                 .header("Authorization", format!("Bot {}", token))
-                .json(&serde_json::json!({"content": chunk}))
+                .json(&body)
                 .send()
                 .await?;
 
