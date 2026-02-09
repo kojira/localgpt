@@ -573,6 +573,56 @@ async fn get_session_messages(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Response {
+    // Check if this is a Discord session
+    if let Some(channel_id) = session_id.strip_prefix("discord-") {
+        if let Some(ref discord_agents) = state.discord_agents {
+            if let Ok(agents) = discord_agents.try_lock() {
+                if let Some(agent) = agents.get(channel_id) {
+                    let messages: Vec<ActiveSessionMessage> = agent
+                        .raw_session_messages()
+                        .iter()
+                        .map(|sm| {
+                            let role = match sm.message.role {
+                                crate::agent::Role::User => "user",
+                                crate::agent::Role::Assistant => "assistant",
+                                crate::agent::Role::System => "system",
+                                crate::agent::Role::Tool => "toolResult",
+                            };
+                            let tool_calls = sm.message.tool_calls.as_ref().map(|tcs| {
+                                tcs.iter()
+                                    .map(|tc| {
+                                        json!({
+                                            "id": tc.id,
+                                            "name": tc.name,
+                                            "arguments": tc.arguments
+                                        })
+                                    })
+                                    .collect()
+                            });
+                            ActiveSessionMessage {
+                                role: role.to_string(),
+                                content: if sm.message.content.is_empty() {
+                                    None
+                                } else {
+                                    Some(sm.message.content.clone())
+                                },
+                                tool_calls,
+                                tool_call_id: sm.message.tool_call_id.clone(),
+                                timestamp: sm.timestamp,
+                            }
+                        })
+                        .collect();
+                    return Json(SessionMessagesResponse {
+                        session_id,
+                        messages,
+                    })
+                    .into_response();
+                }
+            }
+        }
+        return AppError(StatusCode::NOT_FOUND, "Session not found".to_string()).into_response();
+    }
+
     let mut sessions = state.sessions.lock().await;
 
     match sessions.get_mut(&session_id) {
