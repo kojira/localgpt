@@ -49,6 +49,13 @@ pub fn init_workspace(workspace: &Path) -> Result<bool> {
         info!("Created {}", soul_path.display());
     }
 
+    // Create LocalGPT.md security policy template if it doesn't exist
+    let policy_path = workspace.join(crate::security::POLICY_FILENAME);
+    if !policy_path.exists() {
+        fs::write(&policy_path, LOCALGPT_POLICY_TEMPLATE)?;
+        info!("Created {}", policy_path.display());
+    }
+
     // Create .gitignore if it doesn't exist
     let gitignore_path = workspace.join(".gitignore");
     if !gitignore_path.exists() {
@@ -121,6 +128,26 @@ If you change this file, tell the user — it's your soul, and they should know.
 _This file is yours to evolve. As you learn who you are, update it._
 "#;
 
+const LOCALGPT_POLICY_TEMPLATE: &str = r#"# LocalGPT Security Policy
+
+Additional security rules for this workspace. These rules ADD restrictions
+on top of LocalGPT's built-in safety — they cannot weaken or override it.
+
+Edit this file, then run `localgpt security sign` to activate changes.
+
+## Rules
+
+- (Add your workspace-specific security rules here)
+
+## Blocked Patterns
+
+- (Add shell patterns or commands to block, e.g., `curl.*external`)
+
+## Notes
+
+- (Add compliance context, e.g., "This workspace handles medical records")
+"#;
+
 const GITIGNORE_TEMPLATE: &str = r#"# LocalGPT workspace .gitignore
 
 # Nothing to ignore in workspace by default
@@ -128,8 +155,12 @@ const GITIGNORE_TEMPLATE: &str = r#"# LocalGPT workspace .gitignore
 # - MEMORY.md (curated knowledge)
 # - HEARTBEAT.md (pending tasks)
 # - SOUL.md (persona)
+# - LocalGPT.md (security policy)
 # - memory/*.md (daily logs)
 # - skills/ (custom skills)
+
+# Security manifest (managed by localgpt security sign)
+.localgpt_manifest.json
 
 # Temporary files
 *.tmp
@@ -138,7 +169,7 @@ const GITIGNORE_TEMPLATE: &str = r#"# LocalGPT workspace .gitignore
 .DS_Store
 "#;
 
-/// Initialize state directory with .gitignore
+/// Initialize state directory with .gitignore and device key
 pub fn init_state_dir(state_dir: &Path) -> Result<()> {
     fs::create_dir_all(state_dir)?;
 
@@ -147,6 +178,9 @@ pub fn init_state_dir(state_dir: &Path) -> Result<()> {
         fs::write(&gitignore_path, STATE_GITIGNORE_TEMPLATE)?;
         info!("Created {}", gitignore_path.display());
     }
+
+    // Ensure device key exists for security policy signing
+    crate::security::ensure_device_key(state_dir)?;
 
     Ok(())
 }

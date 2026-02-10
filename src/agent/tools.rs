@@ -95,6 +95,15 @@ impl Tool for BashTool {
             .as_u64()
             .unwrap_or(self.default_timeout_ms);
 
+        // Best-effort protected file check for bash commands
+        let suspicious = crate::security::check_bash_command(command);
+        if !suspicious.is_empty() {
+            tracing::warn!(
+                "Bash command may modify protected files: {:?}",
+                suspicious
+            );
+        }
+
         debug!(
             "Executing bash command (timeout: {}ms): {}",
             timeout_ms, command
@@ -261,6 +270,17 @@ impl Tool for WriteFileTool {
         let path = shellexpand::tilde(path).to_string();
         let path = PathBuf::from(&path);
 
+        // Check protected files
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if crate::security::is_workspace_file_protected(name) {
+                anyhow::bail!(
+                    "Cannot write to protected file: {}. This file is managed by the security system. \
+                     Use `localgpt security sign` to update the security policy.",
+                    path.display()
+                );
+            }
+        }
+
         debug!("Writing file: {}", path.display());
 
         // Create parent directories if needed
@@ -336,6 +356,16 @@ impl Tool for EditFileTool {
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
 
         let path = shellexpand::tilde(path).to_string();
+
+        // Check protected files
+        if let Some(name) = std::path::Path::new(&path).file_name().and_then(|n| n.to_str()) {
+            if crate::security::is_workspace_file_protected(name) {
+                anyhow::bail!(
+                    "Cannot edit protected file: {}. This file is managed by the security system.",
+                    path
+                );
+            }
+        }
 
         debug!("Editing file: {}", path);
 

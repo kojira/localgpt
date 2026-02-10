@@ -50,5 +50,6 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::Daemon(args) => cli::daemon::run(args, &cli.agent).await,
         Commands::Memory(args) => cli::memory::run(args, &cli.agent).await,
         Commands::Config(args) => cli::config::run(args).await,
+        Commands::Security(args) => cli::security::run(args).await,
     }
 }

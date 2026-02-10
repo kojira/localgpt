@@ -11,6 +11,7 @@ pub use providers::{
     StreamEvent, StreamResult, ToolCall, ToolSchema, Usage,
 };
 pub use sanitize::{
+    detect_suspicious_patterns, sanitize_tool_output, truncate_with_notice,
     wrap_external_content, wrap_memory_content, wrap_tool_output, MemorySource, SanitizeResult,
     EXTERNAL_CONTENT_END, EXTERNAL_CONTENT_START, MEMORY_CONTENT_END, MEMORY_CONTENT_START,
     TOOL_OUTPUT_END, TOOL_OUTPUT_START,
@@ -74,6 +75,8 @@ pub struct Agent {
     tools: Vec<Box<dyn Tool>>,
     /// Cumulative token usage for this session
     cumulative_usage: Usage,
+    /// Verified security policy content (None if missing, unsigned, or tampered)
+    verified_security_policy: Option<String>,
 }
 
 impl Agent {
@@ -88,6 +91,59 @@ impl Agent {
         let memory = Arc::new(memory);
         let tools = tools::create_default_tools(app_config, Some(Arc::clone(&memory)))?;
 
+        // Load and verify security policy
+        let workspace = app_config.workspace_path();
+        let state_dir = workspace
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("~/.localgpt"));
+
+        let verified_security_policy =
+            match crate::security::load_and_verify_policy(&workspace, state_dir) {
+                crate::security::PolicyVerification::Valid(content) => {
+                    info!("Security policy verified and loaded");
+                    Some(content)
+                }
+                crate::security::PolicyVerification::TamperDetected => {
+                    tracing::warn!(
+                        "⚠ LocalGPT.md tamper detected. Using hardcoded security only."
+                    );
+                    let _ = crate::security::append_audit_entry(
+                        state_dir,
+                        crate::security::AuditAction::TamperDetected,
+                        "",
+                        "session_start",
+                    );
+                    None
+                }
+                crate::security::PolicyVerification::Unsigned => {
+                    info!("LocalGPT.md not signed. Run `localgpt security sign` to activate.");
+                    None
+                }
+                crate::security::PolicyVerification::SuspiciousContent(warnings) => {
+                    tracing::warn!(
+                        "⚠ LocalGPT.md contains suspicious patterns: {:?}. Skipping.",
+                        warnings
+                    );
+                    let _ = crate::security::append_audit_entry(
+                        state_dir,
+                        crate::security::AuditAction::SuspiciousContent,
+                        "",
+                        "session_start",
+                    );
+                    None
+                }
+                crate::security::PolicyVerification::Missing => {
+                    debug!("No LocalGPT.md found, using hardcoded security only.");
+                    None
+                }
+                crate::security::PolicyVerification::ManifestCorrupted => {
+                    tracing::warn!(
+                        "⚠ Security manifest corrupted. Using hardcoded security only."
+                    );
+                    None
+                }
+            };
+
         Ok(Self {
             config,
             app_config: app_config.clone(),
@@ -96,6 +152,7 @@ impl Agent {
             memory,
             tools,
             cumulative_usage: Usage::default(),
+            verified_security_policy,
         })
     }
 
@@ -207,7 +264,7 @@ impl Agent {
         let memory_context = self.build_memory_context().await?;
 
         // Combine system prompt with memory context
-        let full_context = if memory_context.is_empty() {
+        let mut full_context = if memory_context.is_empty() {
             system_prompt
         } else {
             format!(
@@ -215,6 +272,13 @@ impl Agent {
                 system_prompt, memory_context
             )
         };
+
+        // Append ending security block (always last in context)
+        let security_block = crate::security::build_ending_security_block(
+            self.verified_security_policy.as_deref(),
+        );
+        full_context.push_str("\n\n---\n\n");
+        full_context.push_str(&security_block);
 
         self.session.set_system_context(full_context);
 

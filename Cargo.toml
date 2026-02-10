@@ -84,6 +84,10 @@ once_cell = "1"
 fs2 = "0.4"
 rand = "0.8"
 
+# Security (HMAC signing, hashing)
+sha2 = "0.10"
+hmac = "0.12"
+
 # Telegram bot
 teloxide = { version = "0.17", features = ["macros"] }
 
@@ -99,7 +103,6 @@ eframe = { version = "0.30", optional = true, default-features = false, features
 # Unix daemonization (optional, only for daemon mode)
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5"
-sha2 = "0.10"
 rustyline = "17.0.2"
 
 [dev-dependencies]

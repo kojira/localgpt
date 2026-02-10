@@ -15,6 +15,7 @@ pub mod config;
 pub mod desktop;
 pub mod heartbeat;
 pub mod memory;
+pub mod security;
 pub mod server;
 
 pub use config::Config;
