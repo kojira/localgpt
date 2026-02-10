@@ -100,6 +100,13 @@ impl SessionEntry {
         self.updated_at = chrono::Utc::now().timestamp_millis() as u64;
     }
 
+    /// Clear CLI session IDs (called on `/new` to force a fresh CLI session)
+    pub fn clear_cli_session_ids(&mut self) {
+        self.cli_session_ids.clear();
+        self.claude_cli_session_id = None;
+        self.updated_at = chrono::Utc::now().timestamp_millis() as u64;
+    }
+
     /// Check if a heartbeat would be a duplicate (same text within 24 hours)
     pub fn is_duplicate_heartbeat(&self, text: &str) -> bool {
         const DEDUP_WINDOW_MS: u64 = 24 * 60 * 60 * 1000; // 24 hours

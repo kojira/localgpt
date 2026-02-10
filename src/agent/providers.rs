@@ -149,6 +149,11 @@ pub trait LLMProvider: Send + Sync {
 
     async fn summarize(&self, text: &str) -> Result<String>;
 
+    /// Reset provider session state (e.g., clear cached CLI session ID).
+    /// Called when starting a new conversation via `/new`.
+    /// Default: no-op (most providers are stateless).
+    fn reset_session(&self) {}
+
     /// Stream chat response (default: falls back to non-streaming)
     async fn chat_stream(
         &self,
@@ -1460,21 +1465,44 @@ fn normalize_claude_model(model: &str) -> String {
     .to_string()
 }
 
+/// Check if a message is the synthetic security block appended by `messages_for_api_call`.
+fn is_security_block(msg: &Message) -> bool {
+    msg.role == Role::User
+        && msg
+            .content
+            .contains(crate::security::HARDCODED_SECURITY_SUFFIX)
+}
+
 fn build_prompt_from_messages(messages: &[Message]) -> String {
-    // Get the last user message as the prompt
+    // Get the last *real* user message as the prompt, skipping the security block
     messages
         .iter()
         .rev()
-        .find(|m| m.role == Role::User)
+        .find(|m| m.role == Role::User && !is_security_block(m))
         .map(|m| m.content.clone())
         .unwrap_or_default()
 }
 
 fn extract_system_prompt(messages: &[Message]) -> Option<String> {
-    messages
+    let system = messages
         .iter()
         .find(|m| m.role == Role::System)
-        .map(|m| m.content.clone())
+        .map(|m| m.content.clone());
+
+    // For Claude CLI, fold the security block into the system prompt
+    // since the CLI only accepts a single prompt + system prompt
+    let security = messages
+        .iter()
+        .rev()
+        .find(|m| is_security_block(m))
+        .map(|m| m.content.clone());
+
+    match (system, security) {
+        (Some(sys), Some(sec)) => Some(format!("{}\n\n{}", sys, sec)),
+        (Some(sys), None) => Some(sys),
+        (None, Some(sec)) => Some(sec),
+        (None, None) => None,
+    }
 }
 
 /// Parse Claude CLI JSON output, returning (response_text, session_id)
@@ -1508,6 +1536,19 @@ fn parse_claude_cli_output(stdout: &str) -> Result<(String, Option<String>)> {
 
 #[async_trait]
 impl LLMProvider for ClaudeCliProvider {
+    fn reset_session(&self) {
+        if let Ok(mut cli_session) = self.cli_session_id.lock() {
+            *cli_session = None;
+        }
+        // Clear from session store on disk
+        if let Ok(mut store) = super::session_store::SessionStore::load() {
+            let _ = store.update(&self.session_key, &self.localgpt_session_id, |entry| {
+                entry.clear_cli_session_ids();
+            });
+        }
+        info!("Claude CLI session reset (next call will start fresh)");
+    }
+
     async fn chat(
         &self,
         messages: &[Message],

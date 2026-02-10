@@ -316,6 +316,9 @@ impl Agent {
     pub async fn new_session(&mut self) -> Result<()> {
         self.session = Session::new();
 
+        // Reset provider session state (e.g., clear Claude CLI session ID)
+        self.provider.reset_session();
+
         // Load skills from workspace
         let workspace_skills = skills::load_skills(self.memory.workspace()).unwrap_or_default();
         let skills_prompt = skills::build_skills_prompt(&workspace_skills);
@@ -817,6 +820,7 @@ impl Agent {
 
     pub fn clear_session(&mut self) {
         self.session = Session::new();
+        self.provider.reset_session();
     }
 
     pub async fn search_memory(&self, query: &str) -> Result<Vec<MemoryChunk>> {
