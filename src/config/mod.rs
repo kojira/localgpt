@@ -33,6 +33,9 @@ pub struct Config {
     pub tools: ToolsConfig,
 
     #[serde(default)]
+    pub security: SecurityConfig,
+
+    #[serde(default)]
     pub telegram: Option<TelegramConfig>,
 }
 
@@ -78,6 +81,25 @@ pub struct ToolsConfig {
     /// Wrap tool outputs and memory content with XML-style delimiters
     #[serde(default = "default_true")]
     pub use_content_delimiters: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Abort agent startup on tamper or suspicious content (default: false)
+    ///
+    /// When true, `TamperDetected` and `SuspiciousContent` are fatal errors
+    /// that prevent the agent from starting. When false (default), the agent
+    /// warns and falls back to hardcoded-only security.
+    #[serde(default)]
+    pub strict_policy: bool,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            strict_policy: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

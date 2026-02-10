@@ -104,14 +104,23 @@ impl Agent {
                     Some(content)
                 }
                 crate::security::PolicyVerification::TamperDetected => {
-                    tracing::warn!(
-                        "⚠ LocalGPT.md tamper detected. Using hardcoded security only."
-                    );
                     let _ = crate::security::append_audit_entry(
                         state_dir,
                         crate::security::AuditAction::TamperDetected,
                         "",
                         "session_start",
+                    );
+                    if app_config.security.strict_policy {
+                        tracing::error!(
+                            "LocalGPT.md tamper detected — file was modified after signing"
+                        );
+                        anyhow::bail!(
+                            "Security policy tamper detected. \
+                             Re-sign with `localgpt security sign` or remove LocalGPT.md to continue."
+                        );
+                    }
+                    tracing::warn!(
+                        "LocalGPT.md tamper detected. Using hardcoded security only."
                     );
                     None
                 }
@@ -120,15 +129,26 @@ impl Agent {
                     None
                 }
                 crate::security::PolicyVerification::SuspiciousContent(warnings) => {
-                    tracing::warn!(
-                        "⚠ LocalGPT.md contains suspicious patterns: {:?}. Skipping.",
-                        warnings
-                    );
                     let _ = crate::security::append_audit_entry(
                         state_dir,
                         crate::security::AuditAction::SuspiciousContent,
                         "",
                         "session_start",
+                    );
+                    if app_config.security.strict_policy {
+                        tracing::error!(
+                            "LocalGPT.md contains suspicious patterns: {:?}",
+                            warnings
+                        );
+                        anyhow::bail!(
+                            "Security policy rejected — suspicious content detected: {}. \
+                             Fix LocalGPT.md and re-sign with `localgpt security sign`.",
+                            warnings.join(", ")
+                        );
+                    }
+                    tracing::warn!(
+                        "LocalGPT.md contains suspicious patterns: {:?}. Skipping.",
+                        warnings
                     );
                     None
                 }
