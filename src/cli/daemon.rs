@@ -8,6 +8,7 @@ use daemonize::Daemonize;
 
 use localgpt::concurrency::TurnGate;
 use localgpt::config::Config;
+use localgpt::discord::SharedAgentMap;
 use localgpt::heartbeat::HeartbeatRunner;
 use localgpt::memory::MemoryManager;
 use localgpt::server::Server;
@@ -150,6 +151,38 @@ async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
     // Create shared turn gate for heartbeat + HTTP concurrency control
     let turn_gate = TurnGate::new();
 
+    // Create shared Discord agents map (visible to both Discord bot and HTTP server)
+    let discord_agents: Option<SharedAgentMap> = if config
+        .channels
+        .discord
+        .as_ref()
+        .map(|d| d.enabled)
+        .unwrap_or(false)
+    {
+        Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )))
+    } else {
+        None
+    };
+
+    // Spawn Discord bot in background if enabled
+    let discord_handle = if let Some(ref agents) = discord_agents {
+        match localgpt::discord::start(config, Some(agents.clone())).await {
+            Ok(handle) => {
+                println!("  Discord: enabled");
+                Some(handle)
+            }
+            Err(e) => {
+                tracing::error!("Failed to start Discord bot: {}", e);
+                println!("  Discord: failed to start ({})", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Spawn heartbeat in background if enabled
     let heartbeat_handle = if config.heartbeat.enabled {
         let heartbeat_config = config.clone();
@@ -200,7 +233,10 @@ async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
             "  Server: http://{}:{}",
             config.server.bind, config.server.port
         );
-        let server = Server::new_with_gate(config, turn_gate)?;
+        let mut server = Server::new_with_gate(config, turn_gate)?;
+        if let Some(agents) = discord_agents {
+            server = server.with_discord_agents(agents);
+        }
         server.run().await?;
     } else if heartbeat_handle.is_some() {
         // Server not enabled but heartbeat is - wait for Ctrl+C
@@ -216,6 +252,9 @@ async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
         handle.abort();
     }
     if let Some(handle) = telegram_handle {
+        handle.abort();
+    }
+    if let Some(handle) = discord_handle {
         handle.abort();
     }
 

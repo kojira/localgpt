@@ -13,10 +13,12 @@ pub mod concurrency;
 pub mod config;
 #[cfg(feature = "desktop")]
 pub mod desktop;
+pub mod discord;
 pub mod heartbeat;
 pub mod memory;
 pub mod sandbox;
 pub mod security;
 pub mod server;
+pub mod utils;
 
 pub use config::Config;

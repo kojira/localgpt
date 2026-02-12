@@ -6,6 +6,7 @@ pub use schema::*;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -33,13 +34,19 @@ pub struct Config {
     pub tools: ToolsConfig,
 
     #[serde(default)]
-    pub security: SecurityConfig,
+pub security: SecurityConfig,
 
     #[serde(default)]
     pub sandbox: SandboxConfig,
 
     #[serde(default)]
     pub telegram: Option<TelegramConfig>,
+
+    #[serde(default)]
+    pub channels: ChannelsConfig,
+
+    #[serde(default)]
+    pub tags: HashMap<String, TagGroup>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +349,52 @@ pub struct TelegramConfig {
     pub api_token: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChannelsConfig {
+    #[serde(default)]
+    pub discord: Option<DiscordChannelConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscordChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Bot token (use ${DISCORD_BOT_TOKEN} for env var expansion)
+    pub token: String,
+
+    /// Whether to process messages from other bots
+    #[serde(default)]
+    pub allow_bots: bool,
+
+    /// Guild (server) allow-list with per-guild settings
+    #[serde(default)]
+    pub guilds: Vec<DiscordGuildConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscordGuildConfig {
+    pub guild_id: String,
+
+    /// Channel IDs the bot listens in (empty = all channels)
+    #[serde(default)]
+    pub channels: Vec<String>,
+
+    /// Whether the bot must be @mentioned to respond
+    #[serde(default)]
+    pub require_mention: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagGroup {
+    #[serde(default)]
+    pub binary: Option<String>,
+    #[serde(default)]
+    pub config_swap: Option<String>,
+    #[serde(default)]
+    pub patterns: HashMap<String, String>,
+}
+
 // Default value functions
 fn default_model() -> String {
     // Default to Claude CLI (uses existing Claude Code auth, no API key needed)
@@ -593,8 +646,11 @@ impl Config {
         if let Some(ref mut anthropic) = self.providers.anthropic {
             anthropic.api_key = expand_env(&anthropic.api_key);
         }
-        if let Some(ref mut telegram) = self.telegram {
+if let Some(ref mut telegram) = self.telegram {
             telegram.api_token = expand_env(&telegram.api_token);
+        }
+        if let Some(ref mut discord) = self.channels.discord {
+            discord.token = expand_env(&discord.token);
         }
     }
 

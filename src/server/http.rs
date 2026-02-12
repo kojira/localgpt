@@ -33,6 +33,7 @@ use tracing::{debug, info};
 use crate::agent::{Agent, AgentConfig, StreamEvent, extract_tool_detail};
 use crate::concurrency::{TurnGate, WorkspaceLock};
 use crate::config::Config;
+use crate::discord::SharedAgentMap;
 use crate::heartbeat::{HeartbeatStatus, get_last_heartbeat_event};
 use crate::memory::MemoryManager;
 
@@ -53,6 +54,7 @@ const HTTP_AGENT_ID: &str = "http";
 pub struct Server {
     config: Config,
     turn_gate: TurnGate,
+    discord_agents: Option<SharedAgentMap>,
 }
 
 struct SessionEntry {
@@ -71,6 +73,8 @@ struct AppState {
     turn_gate: TurnGate,
     /// Cross-process workspace lock
     workspace_lock: WorkspaceLock,
+    /// Shared Discord agent map (channel_id → Agent), if Discord is enabled
+    discord_agents: Option<SharedAgentMap>,
 }
 
 impl Server {
@@ -78,6 +82,7 @@ impl Server {
         Ok(Self {
             config: config.clone(),
             turn_gate: TurnGate::new(),
+            discord_agents: None,
         })
     }
 
@@ -87,7 +92,14 @@ impl Server {
         Ok(Self {
             config: config.clone(),
             turn_gate,
+            discord_agents: None,
         })
+    }
+
+    /// Set shared Discord agents map for session visibility.
+    pub fn with_discord_agents(mut self, agents: SharedAgentMap) -> Self {
+        self.discord_agents = Some(agents);
+        self
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -103,6 +115,7 @@ impl Server {
             memory,
             turn_gate: self.turn_gate.clone(),
             workspace_lock,
+            discord_agents: self.discord_agents.clone(),
         });
 
         // Load persisted sessions on startup
@@ -369,12 +382,20 @@ struct StatusResponse {
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let sessions = state.sessions.lock().await;
+    let mut count = sessions.len();
+
+    // Add Discord session count if available
+    if let Some(ref discord_agents) = state.discord_agents {
+        if let Ok(agents) = discord_agents.try_lock() {
+            count += agents.len();
+        }
+    }
 
     Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         model: state.config.agent.default_model.clone(),
         memory_chunks: state.memory.chunk_count().unwrap_or(0),
-        active_sessions: sessions.len(),
+        active_sessions: count,
     })
 }
 
@@ -408,6 +429,10 @@ async fn create_session(
 struct SessionInfo {
     session_id: String,
     idle_seconds: u64,
+    source: String,
+    token_count: usize,
+    api_input_tokens: u64,
+    api_output_tokens: u64,
 }
 
 #[derive(Serialize)]
@@ -418,13 +443,37 @@ struct ListSessionsResponse {
 async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<ListSessionsResponse> {
     let sessions = state.sessions.lock().await;
 
-    let session_list: Vec<SessionInfo> = sessions
+    let mut session_list: Vec<SessionInfo> = sessions
         .iter()
-        .map(|(id, entry)| SessionInfo {
-            session_id: id.clone(),
-            idle_seconds: entry.last_accessed.elapsed().as_secs(),
+        .map(|(id, entry)| {
+            let status = entry.agent.session_status();
+            SessionInfo {
+                session_id: id.clone(),
+                idle_seconds: entry.last_accessed.elapsed().as_secs(),
+                source: "http".to_string(),
+                token_count: status.token_count,
+                api_input_tokens: status.api_input_tokens,
+                api_output_tokens: status.api_output_tokens,
+            }
         })
         .collect();
+
+    // Include Discord sessions if available (try_lock to avoid deadlock)
+    if let Some(ref discord_agents) = state.discord_agents {
+        if let Ok(agents) = discord_agents.try_lock() {
+            for (channel_id, agent) in agents.iter() {
+                let status = agent.session_status();
+                session_list.push(SessionInfo {
+                    session_id: format!("discord-{}", channel_id),
+                    idle_seconds: 0,
+                    source: "discord".to_string(),
+                    token_count: status.token_count,
+                    api_input_tokens: status.api_input_tokens,
+                    api_output_tokens: status.api_output_tokens,
+                });
+            }
+        }
+    }
 
     Json(ListSessionsResponse {
         sessions: session_list,
@@ -462,6 +511,28 @@ async fn get_session_status(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Response {
+    // Check if this is a Discord session
+    if let Some(channel_id) = session_id.strip_prefix("discord-") {
+        if let Some(ref discord_agents) = state.discord_agents {
+            if let Ok(agents) = discord_agents.try_lock() {
+                if let Some(agent) = agents.get(channel_id) {
+                    let status = agent.session_status();
+                    return Json(SessionStatusResponse {
+                        session_id,
+                        model: agent.model().to_string(),
+                        message_count: status.message_count,
+                        token_count: status.token_count,
+                        idle_seconds: 0,
+                        api_input_tokens: status.api_input_tokens,
+                        api_output_tokens: status.api_output_tokens,
+                    })
+                    .into_response();
+                }
+            }
+        }
+        return AppError(StatusCode::NOT_FOUND, "Session not found".to_string()).into_response();
+    }
+
     let sessions = state.sessions.lock().await;
 
     match sessions.get(&session_id) {
@@ -502,6 +573,56 @@ async fn get_session_messages(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Response {
+    // Check if this is a Discord session
+    if let Some(channel_id) = session_id.strip_prefix("discord-") {
+        if let Some(ref discord_agents) = state.discord_agents {
+            if let Ok(agents) = discord_agents.try_lock() {
+                if let Some(agent) = agents.get(channel_id) {
+                    let messages: Vec<ActiveSessionMessage> = agent
+                        .raw_session_messages()
+                        .iter()
+                        .map(|sm| {
+                            let role = match sm.message.role {
+                                crate::agent::Role::User => "user",
+                                crate::agent::Role::Assistant => "assistant",
+                                crate::agent::Role::System => "system",
+                                crate::agent::Role::Tool => "toolResult",
+                            };
+                            let tool_calls = sm.message.tool_calls.as_ref().map(|tcs| {
+                                tcs.iter()
+                                    .map(|tc| {
+                                        json!({
+                                            "id": tc.id,
+                                            "name": tc.name,
+                                            "arguments": tc.arguments
+                                        })
+                                    })
+                                    .collect()
+                            });
+                            ActiveSessionMessage {
+                                role: role.to_string(),
+                                content: if sm.message.content.is_empty() {
+                                    None
+                                } else {
+                                    Some(sm.message.content.clone())
+                                },
+                                tool_calls,
+                                tool_call_id: sm.message.tool_call_id.clone(),
+                                timestamp: sm.timestamp,
+                            }
+                        })
+                        .collect();
+                    return Json(SessionMessagesResponse {
+                        session_id,
+                        messages,
+                    })
+                    .into_response();
+                }
+            }
+        }
+        return AppError(StatusCode::NOT_FOUND, "Session not found".to_string()).into_response();
+    }
+
     let mut sessions = state.sessions.lock().await;
 
     match sessions.get_mut(&session_id) {

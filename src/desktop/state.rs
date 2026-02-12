@@ -189,7 +189,7 @@ impl UiState {
                 // Update tool status
                 if let Some(tool) = self.active_tools.iter_mut().find(|t| t.name == name) {
                     let preview = if output.len() > 100 {
-                        format!("{}...", &output[..100])
+                        format!("{}...", crate::utils::safe_truncate(&output, 100))
                     } else {
                         output
                     };
