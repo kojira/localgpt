@@ -8,6 +8,7 @@
 //! - Linux: Landlock LSM (filesystem) + seccomp-bpf (network syscall deny)
 //! - macOS: Seatbelt SBPL profiles via sandbox-exec
 
+#[cfg(unix)]
 pub mod child;
 pub mod detect;
 pub mod executor;
@@ -17,6 +18,7 @@ pub mod linux;
 pub mod macos;
 pub mod policy;
 
+#[cfg(unix)]
 pub use child::sandbox_child_main;
 pub use detect::{detect_capabilities, SandboxCapabilities};
 pub use executor::run_sandboxed;

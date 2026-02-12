@@ -8,6 +8,7 @@ use cli::{Cli, Commands};
 fn main() -> Result<()> {
     // argv[0] dispatch: if re-exec'd as "localgpt-sandbox", enter sandbox child path
     // immediately — before Tokio, Clap, or any other initialization.
+    #[cfg(unix)]
     if let Some(arg0) = std::env::args_os().next() {
         if arg0.to_string_lossy().ends_with("localgpt-sandbox") {
             localgpt::sandbox::sandbox_child_main();

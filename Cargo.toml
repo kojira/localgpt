@@ -88,8 +88,8 @@ rand = "0.8"
 sha2 = "0.10"
 hmac = "0.12"
 
-# Sandbox (process isolation)
-nix = { version = "0.29", features = ["process", "resource", "signal"] }
+# CLI line editor
+rustyline = "17.0.2"
 
 # Telegram bot
 teloxide = { version = "0.17", features = ["macros"] }
@@ -103,10 +103,10 @@ eframe = { version = "0.30", optional = true, default-features = false, features
     "wayland",
 ] }
 
-# Unix daemonization (optional, only for daemon mode)
+# Unix daemonization and sandbox (process isolation)
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5"
-rustyline = "17.0.2"
+nix = { version = "0.29", features = ["process", "resource", "signal"] }
 
 # Linux sandbox (Landlock + seccomp)
 [target.'cfg(target_os = "linux")'.dependencies]
