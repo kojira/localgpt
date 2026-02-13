@@ -17,7 +17,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::receiver::{AudioChunk, VoiceReceiveHandler};
 
@@ -367,6 +367,28 @@ impl VoiceGateway {
             .get(&guild_id)
             .map(|r| r.clone())
             .unwrap_or(VcConnectionState::Disconnected)
+    }
+
+    /// Play PCM f32 audio (48 kHz mono) through the songbird Call for a guild.
+    ///
+    /// Converts PCM to WAV in-memory and feeds it to songbird's mixer.
+    /// Returns an error if the guild has no active Call.
+    pub async fn play_audio(&self, guild_id: u64, pcm: Vec<f32>) -> Result<()> {
+        let call_arc = self
+            .calls
+            .get(&guild_id)
+            .ok_or_else(|| anyhow::anyhow!("No active call for guild {}", guild_id))?
+            .clone();
+
+        let wav_bytes = crate::voice::audio::pcm_f32_to_wav_bytes(&pcm, 48000)
+            .map_err(|e| anyhow::anyhow!("WAV encode failed: {}", e))?;
+
+        let input: songbird::input::Input = wav_bytes.into();
+        let mut call = call_arc.lock().await;
+        call.play_input(input);
+
+        debug!(guild_id, samples = pcm.len(), "Playing TTS audio via songbird");
+        Ok(())
     }
 
     /// Shut down all active calls.

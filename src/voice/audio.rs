@@ -57,6 +57,38 @@ pub fn pcm_f32_to_i16(input: &[f32]) -> Vec<i16> {
         .collect()
 }
 
+/// Convert mono f32 PCM samples (48 kHz, range -1.0..1.0) into WAV bytes.
+///
+/// The resulting WAV can be passed directly to songbird via `Into<Input>`.
+pub fn pcm_f32_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, String> {
+    use std::io::Cursor;
+
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+
+    let mut buf = Vec::new();
+    {
+        let cursor = Cursor::new(&mut buf);
+        let mut writer =
+            hound::WavWriter::new(cursor, spec).map_err(|e| format!("WAV writer: {}", e))?;
+        for &s in samples {
+            let i16_sample = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            writer
+                .write_sample(i16_sample)
+                .map_err(|e| format!("WAV write: {}", e))?;
+        }
+        writer
+            .finalize()
+            .map_err(|e| format!("WAV finalize: {}", e))?;
+    }
+
+    Ok(buf)
+}
+
 /// Compute RMS (root mean square) level of an f32 PCM buffer.
 pub fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
@@ -123,6 +155,32 @@ mod tests {
     fn resample_mono_empty() {
         let output = resample_mono(&[], 24000, 48000).unwrap();
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn pcm_f32_to_wav_bytes_roundtrip() {
+        let samples = vec![0.0f32, 0.5, -0.5, 1.0, -1.0];
+        let wav = pcm_f32_to_wav_bytes(&samples, 48000).unwrap();
+        // Should start with RIFF header
+        assert_eq!(&wav[0..4], b"RIFF");
+        // Parse back with hound
+        let reader =
+            hound::WavReader::new(std::io::Cursor::new(&wav)).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 48000);
+        let read_samples: Vec<i16> = reader.into_samples::<i16>().map(|s| s.unwrap()).collect();
+        assert_eq!(read_samples.len(), 5);
+        // 0.5 * 32767 ≈ 16383
+        assert!((read_samples[1] - 16383).abs() <= 1);
+    }
+
+    #[test]
+    fn pcm_f32_to_wav_bytes_empty() {
+        let wav = pcm_f32_to_wav_bytes(&[], 48000).unwrap();
+        let reader = hound::WavReader::new(std::io::Cursor::new(&wav)).unwrap();
+        let count = reader.into_samples::<i16>().count();
+        assert_eq!(count, 0);
     }
 
     #[test]

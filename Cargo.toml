@@ -31,7 +31,7 @@ tokio = { version = "1.49", features = ["full"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # HTTP client for LLM APIs
-reqwest = { version = "0.13", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "query", "stream"] }
 
 # HTTP server
 axum = { version = "0.8", features = ["ws", "macros"] }
