@@ -21,7 +21,7 @@ desktop = ["eframe"]
 # GGUF embedding model support via llama.cpp (requires C++ compiler)
 gguf = ["llama-cpp-2"]
 # Discord voice chat (STT → LLM → TTS pipeline)
-voice = ["dep:songbird", "dep:rubato", "dep:hound"]
+voice = ["dep:songbird", "dep:rubato", "dep:hound", "dep:opus"]
 
 [dependencies]
 # Async runtime
@@ -113,9 +113,11 @@ eframe = { version = "0.33", optional = true, default-features = false, features
 ] }
 
 # Voice chat (optional — enable with --features voice)
-songbird = { version = "0.5", default-features = false, features = ["driver", "gateway", "rustls", "tungstenite"], optional = true }
+songbird = { version = "0.5", default-features = false, features = ["driver", "gateway", "receive", "rustls", "tungstenite"], optional = true }
 rubato = { version = "0.16", optional = true }
 hound = { version = "3.5", optional = true }
+opus = { version = "0.3", optional = true }
+dashmap = "6.1"
 
 # Unix daemonization and sandbox (process isolation)
 [target.'cfg(unix)'.dependencies]
