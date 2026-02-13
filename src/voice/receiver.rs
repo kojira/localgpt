@@ -59,7 +59,9 @@ impl VoiceReceiveHandler {
 #[async_trait::async_trait]
 impl VoiceEventHandler for VoiceReceiveHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        debug!("VoiceReceiveHandler::act called, ctx variant: {:?}", std::mem::discriminant(ctx));
         if let EventContext::VoiceTick(tick) = ctx {
+            debug!("VoiceTick: speaking={} silent={}", tick.speaking.len(), tick.silent.len());
             for (&ssrc, data) in &tick.speaking {
                 // In DecodeMode::Pass, raw RTP data is in `data.packet`
                 let rtp_data = match &data.packet {
@@ -74,6 +76,7 @@ impl VoiceEventHandler for VoiceReceiveHandler {
                     continue;
                 }
                 let opus_payload = &raw[rtp_data.payload_offset..end];
+                debug!("SSRC {} opus_payload size: {} bytes", ssrc, opus_payload.len());
                 if opus_payload.is_empty() {
                     continue;
                 }
