@@ -24,3 +24,28 @@ impl PipelineWorker {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_new_stores_user_id() {
+        let w = PipelineWorker::new(42);
+        // Verify construction succeeds with any user_id
+        assert_eq!(w._user_id, 42);
+    }
+
+    #[test]
+    fn worker_new_different_users() {
+        let w1 = PipelineWorker::new(1);
+        let w2 = PipelineWorker::new(u64::MAX);
+        assert_ne!(w1._user_id, w2._user_id);
+    }
+
+    #[tokio::test]
+    async fn worker_run_stub_succeeds() {
+        let w = PipelineWorker::new(99);
+        assert!(w.run().await.is_ok());
+    }
+}

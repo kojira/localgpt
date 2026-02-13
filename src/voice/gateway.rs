@@ -29,3 +29,32 @@ impl VoiceGateway {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_new() {
+        let _gw = VoiceGateway::new();
+    }
+
+    #[tokio::test]
+    async fn gateway_join_stub_succeeds() {
+        let gw = VoiceGateway::new();
+        assert!(gw.join(123, 456).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn gateway_leave_stub_succeeds() {
+        let gw = VoiceGateway::new();
+        assert!(gw.leave(123).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn gateway_join_then_leave() {
+        let gw = VoiceGateway::new();
+        gw.join(111, 222).await.unwrap();
+        gw.leave(111).await.unwrap();
+    }
+}

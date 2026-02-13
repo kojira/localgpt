@@ -21,3 +21,19 @@ impl Dispatcher {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatcher_new() {
+        let _d = Dispatcher::new();
+    }
+
+    #[tokio::test]
+    async fn dispatcher_run_stub_succeeds() {
+        let d = Dispatcher::new();
+        assert!(d.run().await.is_ok());
+    }
+}

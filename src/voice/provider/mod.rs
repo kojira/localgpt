@@ -93,3 +93,106 @@ pub trait TtsProvider: Send + Sync {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stt_event_deserialize_speech_start() {
+        let json = r#"{"type":"speech_start","timestamp_ms":1234}"#;
+        let event: SttEvent = serde_json::from_str(json).unwrap();
+        match event {
+            SttEvent::SpeechStart { timestamp_ms } => assert_eq!(timestamp_ms, 1234),
+            _ => panic!("expected SpeechStart"),
+        }
+    }
+
+    #[test]
+    fn stt_event_deserialize_partial() {
+        let json = r#"{"type":"partial","text":"hello"}"#;
+        let event: SttEvent = serde_json::from_str(json).unwrap();
+        match event {
+            SttEvent::Partial { text } => assert_eq!(text, "hello"),
+            _ => panic!("expected Partial"),
+        }
+    }
+
+    #[test]
+    fn stt_event_deserialize_final() {
+        let json = r#"{"type":"final","text":"hello world","language":"en","confidence":0.95,"duration_ms":1500.0}"#;
+        let event: SttEvent = serde_json::from_str(json).unwrap();
+        match event {
+            SttEvent::Final {
+                text,
+                language,
+                confidence,
+                duration_ms,
+            } => {
+                assert_eq!(text, "hello world");
+                assert_eq!(language, "en");
+                assert!((confidence - 0.95).abs() < f32::EPSILON);
+                assert!((duration_ms - 1500.0).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected Final"),
+        }
+    }
+
+    #[test]
+    fn stt_event_deserialize_speech_end() {
+        let json = r#"{"type":"speech_end","timestamp_ms":5678,"duration_ms":2000.0}"#;
+        let event: SttEvent = serde_json::from_str(json).unwrap();
+        match event {
+            SttEvent::SpeechEnd {
+                timestamp_ms,
+                duration_ms,
+            } => {
+                assert_eq!(timestamp_ms, 5678);
+                assert!((duration_ms - 2000.0).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected SpeechEnd"),
+        }
+    }
+
+    #[test]
+    fn stt_event_unknown_type_is_err() {
+        let json = r#"{"type":"unknown","data":123}"#;
+        assert!(serde_json::from_str::<SttEvent>(json).is_err());
+    }
+
+    #[test]
+    fn tts_result_construction() {
+        let result = TtsResult {
+            audio: vec![0.1, 0.2, -0.3],
+            sample_rate: 24000,
+            duration_ms: 100.0,
+        };
+        assert_eq!(result.audio.len(), 3);
+        assert_eq!(result.sample_rate, 24000);
+        assert!((result.duration_ms - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn tts_result_clone() {
+        let result = TtsResult {
+            audio: vec![0.5],
+            sample_rate: 44100,
+            duration_ms: 50.0,
+        };
+        let cloned = result.clone();
+        assert_eq!(cloned.audio, result.audio);
+        assert_eq!(cloned.sample_rate, result.sample_rate);
+    }
+
+    #[test]
+    fn stt_event_clone() {
+        let event = SttEvent::Partial {
+            text: "test".to_string(),
+        };
+        let cloned = event.clone();
+        match cloned {
+            SttEvent::Partial { text } => assert_eq!(text, "test"),
+            _ => panic!("clone should preserve variant"),
+        }
+    }
+}
