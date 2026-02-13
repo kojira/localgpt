@@ -19,6 +19,8 @@ pub mod transcript;
 pub mod tts_cache;
 pub mod tts_pipeline;
 pub mod worker;
+#[cfg(test)]
+mod e2e_test;
 
 pub use config::VoiceManagerConfig;
 pub use gateway::{VoiceGateway, VoiceServerData, VoiceStateData};
