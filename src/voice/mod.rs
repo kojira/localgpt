@@ -10,6 +10,7 @@ pub mod dispatcher;
 pub mod gateway;
 pub mod provider;
 pub mod receiver;
+pub mod transcript;
 pub mod worker;
 
 pub use config::VoiceManagerConfig;

@@ -10,7 +10,9 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+use super::agent_bridge::AgentBridge;
 use super::provider::{SttProvider, TtsProvider};
+use super::transcript::TranscriptEntry;
 use super::worker::PipelineWorker;
 
 /// Routes incoming audio to the correct [`PipelineWorker`].
@@ -18,34 +20,57 @@ pub struct Dispatcher {
     workers: HashMap<u64, mpsc::UnboundedSender<Vec<f32>>>,
     stt_provider: Arc<dyn SttProvider>,
     tts_provider: Arc<dyn TtsProvider>,
+    agent_bridge: Arc<dyn AgentBridge>,
     audio_output_tx: mpsc::UnboundedSender<(u64, Vec<f32>)>,
+    transcript_tx: Option<mpsc::UnboundedSender<TranscriptEntry>>,
+    bot_name: String,
 }
 
 impl Dispatcher {
     pub fn new(
         stt_provider: Arc<dyn SttProvider>,
         tts_provider: Arc<dyn TtsProvider>,
+        agent_bridge: Arc<dyn AgentBridge>,
         audio_output_tx: mpsc::UnboundedSender<(u64, Vec<f32>)>,
+        transcript_tx: Option<mpsc::UnboundedSender<TranscriptEntry>>,
+        bot_name: String,
     ) -> Self {
         Self {
             workers: HashMap::new(),
             stt_provider,
             tts_provider,
+            agent_bridge,
             audio_output_tx,
+            transcript_tx,
+            bot_name,
         }
     }
 
     /// Dispatch audio to the worker for the given user.
     ///
     /// If no worker exists yet, a new one is spawned in a background task.
-    pub fn dispatch(&mut self, user_id: u64, audio: Vec<f32>) {
+    pub fn dispatch(&mut self, user_id: u64, user_name: String, audio: Vec<f32>) {
         let tx = self.workers.entry(user_id).or_insert_with(|| {
             let (tx, rx) = mpsc::unbounded_channel();
             let stt = self.stt_provider.clone();
             let tts = self.tts_provider.clone();
+            let bridge = self.agent_bridge.clone();
             let output_tx = self.audio_output_tx.clone();
+            let transcript_tx = self.transcript_tx.clone();
+            let bot_name = self.bot_name.clone();
+            let uname = user_name.clone();
             tokio::spawn(async move {
-                let mut worker = PipelineWorker::new(user_id, stt, tts, rx, output_tx);
+                let mut worker = PipelineWorker::new(
+                    user_id,
+                    uname,
+                    bot_name,
+                    stt,
+                    tts,
+                    bridge,
+                    rx,
+                    output_tx,
+                    transcript_tx,
+                );
                 if let Err(e) = worker.run().await {
                     error!(user_id, "Worker error: {}", e);
                 }
@@ -70,6 +95,7 @@ impl Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::voice::agent_bridge::MockAgentBridge;
     use crate::voice::provider::stt::mock::{MockSttConfig, MockSttProvider, MockUtterance};
     use crate::voice::provider::tts::mock::MockTtsProvider;
     use std::time::Duration;
@@ -88,8 +114,12 @@ mod tests {
             latency_multiplier: 1.0,
         }));
         let tts: Arc<dyn TtsProvider> = Arc::new(MockTtsProvider::silent());
+        let bridge: Arc<dyn AgentBridge> = Arc::new(MockAgentBridge::new());
         let (out_tx, out_rx) = mpsc::unbounded_channel();
-        (Dispatcher::new(stt, tts, out_tx), out_rx)
+        (
+            Dispatcher::new(stt, tts, bridge, out_tx, None, "Bot".to_string()),
+            out_rx,
+        )
     }
 
     #[test]
@@ -102,7 +132,7 @@ mod tests {
         let (mut d, mut out_rx) = make_dispatcher();
 
         // Dispatch audio for user 1.
-        d.dispatch(1, vec![0.1f32; 400]);
+        d.dispatch(1, "User1".to_string(), vec![0.1f32; 400]);
 
         // Should receive TTS output from the spawned worker.
         let (uid, audio) = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
@@ -117,5 +147,50 @@ mod tests {
     async fn dispatcher_run_stub_succeeds() {
         let (d, _rx) = make_dispatcher();
         assert!(d.run().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatcher_with_transcript() {
+        let stt: Arc<dyn SttProvider> = Arc::new(MockSttProvider::new(MockSttConfig {
+            utterances: vec![MockUtterance {
+                text: "hi".to_string(),
+                language: "en".to_string(),
+                delay_before_start: Duration::ZERO,
+                partial_interval: Duration::ZERO,
+                delay_to_final: Duration::ZERO,
+                confidence: 0.9,
+            }],
+            close_after_all: true,
+            latency_multiplier: 1.0,
+        }));
+        let tts: Arc<dyn TtsProvider> = Arc::new(MockTtsProvider::silent());
+        let bridge: Arc<dyn AgentBridge> = Arc::new(MockAgentBridge::new());
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let (transcript_tx, mut transcript_rx) = mpsc::unbounded_channel();
+
+        let mut d = Dispatcher::new(
+            stt,
+            tts,
+            bridge,
+            out_tx,
+            Some(transcript_tx),
+            "TestBot".to_string(),
+        );
+
+        d.dispatch(1, "Alice".to_string(), vec![0.1f32; 400]);
+
+        // User speech entry.
+        let entry = tokio::time::timeout(Duration::from_secs(5), transcript_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(entry, TranscriptEntry::UserSpeech { .. }));
+
+        // Bot response entry.
+        let entry = tokio::time::timeout(Duration::from_secs(5), transcript_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(entry, TranscriptEntry::BotResponse { .. }));
     }
 }
