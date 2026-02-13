@@ -152,3 +152,50 @@ level = "info"
 
 # Log file path
 file = "~/.localgpt/logs/agent.log"
+
+# ── Voice Chat (requires --features voice) ──────────────────────
+
+# [voice]
+# enabled = true
+#
+# [voice.discord]
+# # Auto-join voice channels on daemon start
+# [[voice.discord.auto_join]]
+# guild_id = "1234567890"
+# channel_id = "9876543210"
+#
+# [voice.pipeline]
+# interrupt_enabled = true       # Barge-in: cancel playback when user speaks
+# idle_timeout_sec = 300          # Stop worker after 5 min silence
+#
+# [voice.stt]
+# provider = "ws"                 # "ws" (WebSocket to external STT server)
+#
+# [voice.stt.ws]
+# endpoint = "ws://127.0.0.1:8766/ws"
+# reconnect_interval_ms = 1000
+# max_reconnect_attempts = 10
+#
+# [voice.tts]
+# provider = "aivis-speech"       # "aivis-speech" (VOICEVOX-compatible)
+#
+# [voice.tts.aivis_speech]
+# endpoint = "http://127.0.0.1:10101"
+# style_id = 888753760
+# speed_scale = 1.0
+# pitch_scale = 0.0
+# intonation_scale = 1.0
+# volume_scale = 1.0
+#
+# [voice.agent]
+# # Override system prompt for voice sessions (optional)
+# # system_prompt_override = "You are a voice assistant. Keep responses short."
+#
+# [voice.audio]
+# input_sample_rate = 48000       # Discord standard
+# stt_sample_rate = 16000         # STT input rate
+# playback_prebuffer_ms = 100     # Buffer before starting playback
+#
+# [voice.transcript]
+# enabled = false                 # Post STT/TTS text to a text channel
+# # channel_id = "1234567890"

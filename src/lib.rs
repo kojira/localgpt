@@ -20,5 +20,7 @@ pub mod sandbox;
 pub mod security;
 pub mod server;
 pub mod utils;
+#[cfg(feature = "voice")]
+pub mod voice;
 
 pub use config::Config;

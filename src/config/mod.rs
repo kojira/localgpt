@@ -47,6 +47,222 @@ pub security: SecurityConfig,
 
     #[serde(default)]
     pub tags: HashMap<String, TagGroup>,
+
+    #[serde(default)]
+    pub voice: Option<VoiceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub discord: VoiceDiscordConfig,
+
+    #[serde(default)]
+    pub pipeline: VoicePipelineConfig,
+
+    #[serde(default)]
+    pub stt: VoiceSttConfig,
+
+    #[serde(default)]
+    pub tts: VoiceTtsConfig,
+
+    #[serde(default)]
+    pub agent: VoiceAgentConfig,
+
+    #[serde(default)]
+    pub audio: VoiceAudioConfig,
+
+    #[serde(default)]
+    pub transcript: VoiceTranscriptConfig,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            discord: VoiceDiscordConfig::default(),
+            pipeline: VoicePipelineConfig::default(),
+            stt: VoiceSttConfig::default(),
+            tts: VoiceTtsConfig::default(),
+            agent: VoiceAgentConfig::default(),
+            audio: VoiceAudioConfig::default(),
+            transcript: VoiceTranscriptConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VoiceDiscordConfig {
+    #[serde(default)]
+    pub auto_join: Vec<VoiceAutoJoinEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceAutoJoinEntry {
+    pub guild_id: String,
+    pub channel_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoicePipelineConfig {
+    #[serde(default = "default_true")]
+    pub interrupt_enabled: bool,
+
+    /// Idle timeout in seconds (0 = disabled)
+    #[serde(default = "default_voice_idle_timeout")]
+    pub idle_timeout_sec: u64,
+}
+
+impl Default for VoicePipelineConfig {
+    fn default() -> Self {
+        Self {
+            interrupt_enabled: true,
+            idle_timeout_sec: default_voice_idle_timeout(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceSttConfig {
+    #[serde(default = "default_voice_stt_provider")]
+    pub provider: String,
+
+    #[serde(default)]
+    pub ws: VoiceSttWsConfig,
+}
+
+impl Default for VoiceSttConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_voice_stt_provider(),
+            ws: VoiceSttWsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceSttWsConfig {
+    #[serde(default = "default_voice_stt_ws_endpoint")]
+    pub endpoint: String,
+
+    #[serde(default = "default_voice_stt_reconnect_interval")]
+    pub reconnect_interval_ms: u64,
+
+    #[serde(default = "default_voice_stt_max_reconnect")]
+    pub max_reconnect_attempts: u32,
+}
+
+impl Default for VoiceSttWsConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: default_voice_stt_ws_endpoint(),
+            reconnect_interval_ms: default_voice_stt_reconnect_interval(),
+            max_reconnect_attempts: default_voice_stt_max_reconnect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceTtsConfig {
+    #[serde(default = "default_voice_tts_provider")]
+    pub provider: String,
+
+    #[serde(default)]
+    pub aivis_speech: VoiceTtsAivisSpeechConfig,
+}
+
+impl Default for VoiceTtsConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_voice_tts_provider(),
+            aivis_speech: VoiceTtsAivisSpeechConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceTtsAivisSpeechConfig {
+    #[serde(default = "default_voice_tts_aivis_endpoint")]
+    pub endpoint: String,
+
+    #[serde(default = "default_voice_tts_aivis_style_id")]
+    pub style_id: u64,
+
+    #[serde(default = "default_voice_tts_speed_scale")]
+    pub speed_scale: f64,
+
+    #[serde(default)]
+    pub pitch_scale: f64,
+
+    #[serde(default = "default_voice_tts_intonation_scale")]
+    pub intonation_scale: f64,
+
+    #[serde(default = "default_voice_tts_volume_scale")]
+    pub volume_scale: f64,
+}
+
+impl Default for VoiceTtsAivisSpeechConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: default_voice_tts_aivis_endpoint(),
+            style_id: default_voice_tts_aivis_style_id(),
+            speed_scale: default_voice_tts_speed_scale(),
+            pitch_scale: 0.0,
+            intonation_scale: default_voice_tts_intonation_scale(),
+            volume_scale: default_voice_tts_volume_scale(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VoiceAgentConfig {
+    /// Override system prompt for voice sessions
+    #[serde(default)]
+    pub system_prompt_override: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceAudioConfig {
+    #[serde(default = "default_voice_input_sample_rate")]
+    pub input_sample_rate: u32,
+
+    #[serde(default = "default_voice_stt_sample_rate")]
+    pub stt_sample_rate: u32,
+
+    #[serde(default = "default_voice_playback_prebuffer")]
+    pub playback_prebuffer_ms: u32,
+}
+
+impl Default for VoiceAudioConfig {
+    fn default() -> Self {
+        Self {
+            input_sample_rate: default_voice_input_sample_rate(),
+            stt_sample_rate: default_voice_stt_sample_rate(),
+            playback_prebuffer_ms: default_voice_playback_prebuffer(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceTranscriptConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Text channel ID for posting transcripts
+    #[serde(default)]
+    pub channel_id: Option<String>,
+}
+
+impl Default for VoiceTranscriptConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            channel_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -504,6 +720,50 @@ fn default_sandbox_max_processes() -> u32 {
 }
 fn default_sandbox_network_policy() -> String {
     "deny".to_string()
+}
+
+// Voice config defaults
+fn default_voice_idle_timeout() -> u64 {
+    300 // 5 minutes
+}
+fn default_voice_stt_provider() -> String {
+    "ws".to_string()
+}
+fn default_voice_stt_ws_endpoint() -> String {
+    "ws://127.0.0.1:8766/ws".to_string()
+}
+fn default_voice_stt_reconnect_interval() -> u64 {
+    1000
+}
+fn default_voice_stt_max_reconnect() -> u32 {
+    10
+}
+fn default_voice_tts_provider() -> String {
+    "aivis-speech".to_string()
+}
+fn default_voice_tts_aivis_endpoint() -> String {
+    "http://127.0.0.1:10101".to_string()
+}
+fn default_voice_tts_aivis_style_id() -> u64 {
+    888753760
+}
+fn default_voice_tts_speed_scale() -> f64 {
+    1.0
+}
+fn default_voice_tts_intonation_scale() -> f64 {
+    1.0
+}
+fn default_voice_tts_volume_scale() -> f64 {
+    1.0
+}
+fn default_voice_input_sample_rate() -> u32 {
+    48000
+}
+fn default_voice_stt_sample_rate() -> u32 {
+    16000
+}
+fn default_voice_playback_prebuffer() -> u32 {
+    100
 }
 
 impl Default for AgentConfig {
