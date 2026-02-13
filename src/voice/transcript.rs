@@ -21,6 +21,12 @@ pub enum TranscriptEntry {
         bot_name: String,
         text: String,
     },
+    /// Bot response that was interrupted by user barge-in.
+    /// Only the played (completed) portion is recorded.
+    BotResponseInterrupted {
+        bot_name: String,
+        played_text: String,
+    },
 }
 
 /// Format a transcript entry for display.
@@ -31,6 +37,15 @@ pub fn format_entry(entry: &TranscriptEntry) -> String {
         }
         TranscriptEntry::BotResponse { bot_name, text } => {
             format!("\u{1f50a} {}: {}", bot_name, text)
+        }
+        TranscriptEntry::BotResponseInterrupted {
+            bot_name,
+            played_text,
+        } => {
+            format!(
+                "\u{1f50a} {}: {}\u{2026}\u{ff08}\u{5272}\u{308a}\u{8fbc}\u{307f}\u{ff09}",
+                bot_name, played_text
+            )
         }
     }
 }
@@ -90,6 +105,19 @@ mod tests {
             text: "Hi there".to_string(),
         };
         assert_eq!(format_entry(&entry), "\u{1f50a} Bot: Hi there");
+    }
+
+    #[test]
+    fn format_bot_response_interrupted() {
+        let entry = TranscriptEntry::BotResponseInterrupted {
+            bot_name: "Bot".to_string(),
+            played_text: "Hello, I was saying".to_string(),
+        };
+        let formatted = format_entry(&entry);
+        assert!(formatted.contains("Bot"));
+        assert!(formatted.contains("Hello, I was saying"));
+        assert!(formatted.contains("\u{2026}"));
+        assert!(formatted.contains("\u{5272}\u{308a}\u{8fbc}\u{307f}"));
     }
 
     #[test]
