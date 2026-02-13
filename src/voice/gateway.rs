@@ -96,11 +96,13 @@ pub struct VoiceServerData {
 /// Build a songbird Config that decodes received audio to 16 kHz mono.
 fn songbird_receive_config() -> songbird::Config {
     use songbird::driver::{Channels, DecodeMode, SampleRate};
+    use std::time::Duration;
 
     songbird::Config::default()
         .decode_mode(DecodeMode::Decode)
         .decode_channels(Channels::Mono)
         .decode_sample_rate(SampleRate::Hz16000)
+        .driver_timeout(Some(Duration::from_secs(30)))
 }
 
 // ─── VoiceGateway ──────────────────────────────────────────────────
@@ -258,9 +260,29 @@ impl VoiceGateway {
         };
         let channel_nz = NonZeroU64::new(channel_id);
 
+        // Sanitise endpoint: songbird expects bare host:port, but Discord
+        // sometimes sends "wss://host:port" or "host:port/" variants.
+        let endpoint = data
+            .endpoint
+            .trim()
+            .strip_prefix("wss://")
+            .unwrap_or(&data.endpoint)
+            .trim_end_matches('/')
+            .to_string();
+
+        debug!(
+            guild_id = data.guild_id,
+            %endpoint,
+            session_id = %state.session_id,
+            token_len = data.token.len(),
+            user_id = self.bot_user_id,
+            channel_id,
+            "Building ConnectionInfo for songbird"
+        );
+
         let connection_info = ConnectionInfo {
             channel_id: channel_nz.map(ChannelId),
-            endpoint: data.endpoint.clone(),
+            endpoint,
             guild_id: GuildId(guild_nz),
             session_id: state.session_id.clone(),
             token: data.token.clone(),
