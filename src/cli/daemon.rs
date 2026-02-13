@@ -168,9 +168,40 @@ async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
 
     // Spawn Discord bot in background if enabled
     let discord_handle = if let Some(ref agents) = discord_agents {
-        match localgpt::discord::start(config, Some(agents.clone())).await {
+        #[cfg(feature = "voice")]
+        let voice_manager = if let Some(ref voice_config) = config.voice {
+            if voice_config.enabled {
+                let voice_manager_config = localgpt::voice::VoiceManagerConfig::from_voice_config(voice_config.clone());
+                Some(std::sync::Arc::new(tokio::sync::Mutex::new(localgpt::voice::VoiceManager::new(voice_manager_config))))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        #[cfg(feature = "voice")]
+        let start_result = if voice_manager.is_some() {
+            localgpt::discord::start_with_voice(config, Some(agents.clone()), voice_manager).await
+        } else {
+            localgpt::discord::start(config, Some(agents.clone())).await
+        };
+
+        #[cfg(not(feature = "voice"))]
+        let start_result = localgpt::discord::start(config, Some(agents.clone())).await;
+
+        match start_result {
             Ok(handle) => {
+                #[cfg(feature = "voice")]
+                if config.voice.as_ref().map(|v| v.enabled).unwrap_or(false) {
+                    println!("  Discord: enabled (with voice support)");
+                } else {
+                    println!("  Discord: enabled");
+                }
+
+                #[cfg(not(feature = "voice"))]
                 println!("  Discord: enabled");
+
                 Some(handle)
             }
             Err(e) => {

@@ -184,7 +184,7 @@ pub struct DiscordBot {
     queue_tx: mpsc::Sender<QueuedMessage>,
     queue_rx: Option<mpsc::Receiver<QueuedMessage>>,
     #[cfg(feature = "voice")]
-    voice_manager: Option<Arc<crate::voice::VoiceManager>>,
+    voice_manager: Option<Arc<Mutex<crate::voice::VoiceManager>>>,
 }
 
 impl DiscordBot {
@@ -766,7 +766,7 @@ impl DiscordBot {
                     match payload.op {
                         OP_DISPATCH => {
                             if let Some(ref event_name) = payload.t {
-                                self.handle_dispatch(event_name, payload.d, state).await;
+                                self.handle_dispatch(event_name, payload.d, state, sink).await;
                             }
                         }
                         OP_HEARTBEAT => {
@@ -815,6 +815,7 @@ impl DiscordBot {
         event_name: &str,
         data: Option<serde_json::Value>,
         state: &mut SessionState,
+        sink: &Arc<Mutex<WsSink>>,
     ) {
         match event_name {
             "READY" => {
@@ -827,7 +828,55 @@ impl DiscordBot {
                             );
                             state.session_id = Some(ready.session_id);
                             state.resume_url = Some(ready.resume_gateway_url);
+                            let bot_user_id_str = ready.user.id.clone();
                             state.bot_user_id = Some(ready.user.id);
+
+                            #[cfg(feature = "voice")]
+                            if let Some(ref voice_manager) = self.voice_manager {
+                                // Initialize voice gateway
+                                if let Ok(bot_user_id) = bot_user_id_str.parse::<u64>() {
+                                    // Create channel for bridging voice manager to WebSocket
+                                    let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(100);
+
+                                    // Spawn task to forward messages from voice manager to WebSocket
+                                    let sink_clone = sink.clone();
+                                    tokio::spawn(async move {
+                                        while let Some(payload) = gateway_rx.recv().await {
+                                            if let Ok(text) = serde_json::to_string(&payload) {
+                                                let _ = sink_clone.lock().await.send(WsMessage::Text(text)).await;
+                                            }
+                                        }
+                                    });
+
+                                    // Initialize voice gateway (requires mutable access)
+                                    {
+                                        let mut vm = voice_manager.lock().await;
+                                        vm.init_gateway(bot_user_id);
+                                        info!("Voice gateway initialized for bot user {}", bot_user_id);
+                                    }
+
+                                    // Auto-join configured voice channels
+                                    if let Some(ref voice_config) = self.config.voice {
+                                        let vm = voice_manager.lock().await;
+                                        for auto_join in &voice_config.discord.auto_join {
+                                            if let (Ok(guild_id), Ok(channel_id)) = (
+                                                auto_join.guild_id.parse::<u64>(),
+                                                auto_join.channel_id.parse::<u64>()
+                                            ) {
+                                                if let Err(e) = vm.join(guild_id, channel_id, &gateway_tx).await {
+                                                    error!("Failed to join voice channel {}:{}: {}", guild_id, channel_id, e);
+                                                } else {
+                                                    info!("Joined voice channel {}:{}", guild_id, channel_id);
+                                                }
+                                            } else {
+                                                error!("Invalid guild_id or channel_id in auto_join: {}:{}", auto_join.guild_id, auto_join.channel_id);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    error!("Failed to parse bot_user_id: {}", bot_user_id_str);
+                                }
+                            }
                         }
                         Err(e) => error!("Failed to parse READY: {}", e),
                     }
@@ -870,7 +919,7 @@ impl DiscordBot {
                                     user_id,
                                     session_id: vsu.session_id,
                                 };
-                                vm.handle_voice_state_update(data).await;
+                                vm.lock().await.handle_voice_state_update(data).await;
                             }
                         }
                         Err(e) => error!("Failed to parse VOICE_STATE_UPDATE: {}", e),
@@ -892,7 +941,7 @@ impl DiscordBot {
                                         token: vsu.token,
                                         endpoint,
                                     };
-                                    vm.handle_voice_server_update(data).await;
+                                    vm.lock().await.handle_voice_server_update(data).await;
                                 } else {
                                     warn!("Voice Server Update has no endpoint");
                                 }
@@ -1636,7 +1685,7 @@ pub async fn start(
 pub async fn start_with_voice(
     config: &Config,
     agents: Option<SharedAgentMap>,
-    voice_manager: Option<Arc<crate::voice::VoiceManager>>,
+    voice_manager: Option<Arc<Mutex<crate::voice::VoiceManager>>>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let mut bot = DiscordBot::new(config.clone())?;
     bot.voice_manager = voice_manager;
