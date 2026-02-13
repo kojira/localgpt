@@ -501,6 +501,16 @@ async fn show_status() -> Result<()> {
             config.server.bind, config.server.port
         );
     }
+    let voice_enabled = config.voice.as_ref().is_some_and(|v| v.enabled);
+    println!("  Voice enabled: {}", voice_enabled);
+    if voice_enabled {
+        if let Some(ref vc) = config.voice {
+            let auto_join_count = vc.discord.auto_join.len();
+            if auto_join_count > 0 {
+                println!("  Voice auto-join channels: {}", auto_join_count);
+            }
+        }
+    }
 
     Ok(())
 }
