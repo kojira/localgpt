@@ -77,8 +77,8 @@ mod tests {
     #[test]
     fn default_tts_aivis_config() {
         let aivis = VoiceTtsAivisSpeechConfig::default();
-        assert_eq!(aivis.endpoint, "http://127.0.0.1:10101");
-        assert_eq!(aivis.style_id, 888753760);
+        assert_eq!(aivis.endpoint, "http://127.0.0.1:8001");
+        assert_eq!(aivis.model, "donchan");
         assert!((aivis.speed_scale - 1.0).abs() < f64::EPSILON);
         assert!((aivis.volume_scale - 1.0).abs() < f64::EPSILON);
     }

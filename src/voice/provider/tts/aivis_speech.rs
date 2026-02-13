@@ -1,12 +1,10 @@
-//! AivisSpeech (VOICEVOX-compatible) TTS provider.
-//!
-//! Communicates via REST API: `/audio_query` → `/synthesis`.
+//! AivisSpeech TTS provider using the `/voice` endpoint.
 //!
 //! Flow:
-//! 1. POST `/audio_query?text=X&speaker=ID` → JSON query parameters
-//! 2. Apply speed/pitch/intonation/volume scales from config
-//! 3. POST `/synthesis?speaker=ID` with JSON body → WAV audio
-//! 4. Parse WAV (i16) → f32 → resample 24 kHz → 48 kHz
+//! 1. POST `{endpoint}/voice?model=M&text=T&speed=S&format=wav` → WAV bytes
+//! 2. Parse WAV header to detect sample rate
+//! 3. Convert i16 PCM → f32, apply volume scale
+//! 4. Resample to 48 kHz for Discord playback
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -14,10 +12,10 @@ use std::io::Cursor;
 use tracing::debug;
 
 use crate::config::VoiceTtsAivisSpeechConfig;
-use crate::voice::audio::{pcm_i16_to_f32, resample_24k_to_48k};
+use crate::voice::audio::{pcm_i16_to_f32, resample_mono};
 use crate::voice::provider::{TtsProvider, TtsResult};
 
-/// AivisSpeech TTS provider using VOICEVOX-compatible REST API.
+/// AivisSpeech TTS provider using the `/voice` REST endpoint.
 pub struct AivisSpeechProvider {
     config: VoiceTtsAivisSpeechConfig,
     client: reqwest::Client,
@@ -28,28 +26,6 @@ impl AivisSpeechProvider {
         Self {
             config,
             client: reqwest::Client::new(),
-        }
-    }
-
-    /// Apply configured voice parameters to the audio_query JSON.
-    fn apply_scales(&self, query: &mut serde_json::Value) {
-        if let Some(obj) = query.as_object_mut() {
-            obj.insert(
-                "speedScale".to_string(),
-                serde_json::json!(self.config.speed_scale),
-            );
-            obj.insert(
-                "pitchScale".to_string(),
-                serde_json::json!(self.config.pitch_scale),
-            );
-            obj.insert(
-                "intonationScale".to_string(),
-                serde_json::json!(self.config.intonation_scale),
-            );
-            obj.insert(
-                "volumeScale".to_string(),
-                serde_json::json!(self.config.volume_scale),
-            );
         }
     }
 
@@ -71,57 +47,49 @@ impl TtsProvider for AivisSpeechProvider {
     async fn synthesize(&self, text: &str) -> Result<TtsResult> {
         let base = self.config.endpoint.trim_end_matches('/');
 
-        // Step 1: POST /audio_query to get synthesis parameters
-        let mut query: serde_json::Value = self
+        // POST /voice with query params
+        let wav_bytes = self
             .client
-            .post(format!("{}/audio_query", base))
+            .post(format!("{}/voice", base))
             .query(&[
+                ("model", self.config.model.as_str()),
                 ("text", text),
-                ("speaker", &self.config.style_id.to_string()),
+                ("speed", &self.config.speed_scale.to_string()),
+                ("format", "wav"),
             ])
             .send()
             .await
-            .context("audio_query request failed")?
+            .context("voice request failed")?
             .error_for_status()
-            .context("audio_query returned error status")?
-            .json()
-            .await
-            .context("failed to parse audio_query response as JSON")?;
-
-        // Step 2: Apply voice parameter overrides from config
-        self.apply_scales(&mut query);
-
-        debug!(
-            speed = self.config.speed_scale,
-            pitch = self.config.pitch_scale,
-            intonation = self.config.intonation_scale,
-            volume = self.config.volume_scale,
-            "applied voice scales to audio_query"
-        );
-
-        // Step 3: POST /synthesis with modified query → WAV audio
-        let wav_bytes = self
-            .client
-            .post(format!("{}/synthesis", base))
-            .query(&[("speaker", &self.config.style_id.to_string())])
-            .json(&query)
-            .send()
-            .await
-            .context("synthesis request failed")?
-            .error_for_status()
-            .context("synthesis returned error status")?
+            .context("voice endpoint returned error status")?
             .bytes()
             .await
-            .context("failed to read synthesis response body")?;
+            .context("failed to read voice response body")?;
 
-        // Step 4: Parse WAV → i16 samples
-        let (samples_i16, _wav_sr) = Self::parse_wav(&wav_bytes)?;
+        // Parse WAV → i16 samples + detect sample rate
+        let (samples_i16, wav_sr) = Self::parse_wav(&wav_bytes)?;
 
-        // Step 5: Convert i16 → f32
-        let samples_f32 = pcm_i16_to_f32(&samples_i16);
+        debug!(
+            wav_sample_rate = wav_sr,
+            samples = samples_i16.len(),
+            model = %self.config.model,
+            speed = self.config.speed_scale,
+            "AivisSpeech WAV received"
+        );
 
-        // Step 6: Resample 24 kHz → 48 kHz for Discord playback
-        let resampled = resample_24k_to_48k(&samples_f32)
+        // Convert i16 → f32
+        let mut samples_f32 = pcm_i16_to_f32(&samples_i16);
+
+        // Apply volume scale
+        if (self.config.volume_scale - 1.0).abs() > f64::EPSILON {
+            let vol = self.config.volume_scale as f32;
+            for s in &mut samples_f32 {
+                *s *= vol;
+            }
+        }
+
+        // Resample to 48 kHz for Discord playback
+        let resampled = resample_mono(&samples_f32, wav_sr, 48000)
             .map_err(|e| anyhow::anyhow!("resampling failed: {}", e))?;
 
         let duration_ms = resampled.len() as f64 / 48000.0 * 1000.0;
@@ -155,66 +123,6 @@ mod tests {
     #[test]
     fn provider_name() {
         assert_eq!(default_provider().name(), "aivis-speech");
-    }
-
-    #[test]
-    fn apply_scales_default_config() {
-        let provider = default_provider();
-        let mut query = serde_json::json!({
-            "accent_phrases": [],
-            "speedScale": 1.0,
-            "pitchScale": 0.0,
-            "intonationScale": 1.0,
-            "volumeScale": 1.0,
-        });
-        provider.apply_scales(&mut query);
-        assert_eq!(query["speedScale"], 1.0);
-        assert_eq!(query["pitchScale"], 0.0);
-        assert_eq!(query["intonationScale"], 1.0);
-        assert_eq!(query["volumeScale"], 1.0);
-    }
-
-    #[test]
-    fn apply_scales_custom_values() {
-        let provider = AivisSpeechProvider::new(VoiceTtsAivisSpeechConfig {
-            speed_scale: 1.5,
-            pitch_scale: 0.1,
-            intonation_scale: 1.2,
-            volume_scale: 0.8,
-            ..Default::default()
-        });
-        let mut query = serde_json::json!({
-            "accent_phrases": [],
-            "speedScale": 1.0,
-            "pitchScale": 0.0,
-            "intonationScale": 1.0,
-            "volumeScale": 1.0,
-        });
-        provider.apply_scales(&mut query);
-        assert_eq!(query["speedScale"], 1.5);
-        assert_eq!(query["pitchScale"], 0.1);
-        assert_eq!(query["intonationScale"], 1.2);
-        assert_eq!(query["volumeScale"], 0.8);
-    }
-
-    #[test]
-    fn apply_scales_adds_missing_keys() {
-        let provider = AivisSpeechProvider::new(VoiceTtsAivisSpeechConfig {
-            speed_scale: 2.0,
-            ..Default::default()
-        });
-        let mut query = serde_json::json!({"accent_phrases": []});
-        provider.apply_scales(&mut query);
-        assert_eq!(query["speedScale"], 2.0);
-        assert_eq!(query["pitchScale"], 0.0);
-    }
-
-    #[test]
-    fn apply_scales_non_object_is_noop() {
-        let provider = default_provider();
-        let mut query = serde_json::json!("not an object");
-        provider.apply_scales(&mut query);
-        assert_eq!(query, serde_json::json!("not an object"));
     }
 
     #[test]
@@ -269,9 +177,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_wav_detects_sample_rate() {
+        // Create a WAV at 44100 Hz to verify we detect it correctly
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut buf = Vec::new();
+        {
+            let cursor = Cursor::new(&mut buf);
+            let mut writer = hound::WavWriter::new(cursor, spec).unwrap();
+            for _ in 0..100 {
+                writer.write_sample(0i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+
+        let (samples, sample_rate) = AivisSpeechProvider::parse_wav(&buf).unwrap();
+        assert_eq!(sample_rate, 44100);
+        assert_eq!(samples.len(), 100);
+    }
+
+    #[test]
     fn full_pipeline_wav_to_resampled() {
         // Simulate the post-HTTP portion of synthesize:
-        // parse WAV → i16→f32 → resample 24k→48k
+        // parse WAV → i16→f32 → resample to 48k
         let spec = hound::WavSpec {
             channels: 1,
             sample_rate: 24000,
@@ -300,7 +232,7 @@ mod tests {
         // Values should be in -1.0..1.0 range
         assert!(samples_f32.iter().all(|&s| s >= -1.0 && s <= 1.0));
 
-        let resampled = resample_24k_to_48k(&samples_f32).unwrap();
+        let resampled = resample_mono(&samples_f32, 24000, 48000).unwrap();
         // Should roughly double (rubato may produce slightly fewer due to filter delay)
         assert!(
             resampled.len() > 400 && resampled.len() <= 1100,
@@ -316,15 +248,14 @@ mod tests {
     fn constructor_stores_config() {
         let config = VoiceTtsAivisSpeechConfig {
             endpoint: "http://localhost:9999".to_string(),
-            style_id: 42,
+            model: "testmodel".to_string(),
             speed_scale: 2.0,
-            pitch_scale: 0.5,
-            intonation_scale: 1.5,
             volume_scale: 0.7,
         };
         let provider = AivisSpeechProvider::new(config);
         assert_eq!(provider.config.endpoint, "http://localhost:9999");
-        assert_eq!(provider.config.style_id, 42);
+        assert_eq!(provider.config.model, "testmodel");
         assert_eq!(provider.config.speed_scale, 2.0);
+        assert_eq!(provider.config.volume_scale, 0.7);
     }
 }

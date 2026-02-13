@@ -188,17 +188,11 @@ pub struct VoiceTtsAivisSpeechConfig {
     #[serde(default = "default_voice_tts_aivis_endpoint")]
     pub endpoint: String,
 
-    #[serde(default = "default_voice_tts_aivis_style_id")]
-    pub style_id: u64,
+    #[serde(default = "default_voice_tts_aivis_model")]
+    pub model: String,
 
     #[serde(default = "default_voice_tts_speed_scale")]
     pub speed_scale: f64,
-
-    #[serde(default)]
-    pub pitch_scale: f64,
-
-    #[serde(default = "default_voice_tts_intonation_scale")]
-    pub intonation_scale: f64,
 
     #[serde(default = "default_voice_tts_volume_scale")]
     pub volume_scale: f64,
@@ -208,10 +202,8 @@ impl Default for VoiceTtsAivisSpeechConfig {
     fn default() -> Self {
         Self {
             endpoint: default_voice_tts_aivis_endpoint(),
-            style_id: default_voice_tts_aivis_style_id(),
+            model: default_voice_tts_aivis_model(),
             speed_scale: default_voice_tts_speed_scale(),
-            pitch_scale: 0.0,
-            intonation_scale: default_voice_tts_intonation_scale(),
             volume_scale: default_voice_tts_volume_scale(),
         }
     }
@@ -742,15 +734,12 @@ fn default_voice_tts_provider() -> String {
     "aivis-speech".to_string()
 }
 fn default_voice_tts_aivis_endpoint() -> String {
-    "http://127.0.0.1:10101".to_string()
+    "http://127.0.0.1:8001".to_string()
 }
-fn default_voice_tts_aivis_style_id() -> u64 {
-    888753760
+fn default_voice_tts_aivis_model() -> String {
+    "donchan".to_string()
 }
 fn default_voice_tts_speed_scale() -> f64 {
-    1.0
-}
-fn default_voice_tts_intonation_scale() -> f64 {
     1.0
 }
 fn default_voice_tts_volume_scale() -> f64 {
