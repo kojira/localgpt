@@ -8,9 +8,13 @@ pub mod audio;
 pub mod config;
 pub mod dispatcher;
 pub mod gateway;
+pub mod playback;
 pub mod provider;
 pub mod receiver;
+pub mod splitter;
 pub mod transcript;
+pub mod tts_cache;
+pub mod tts_pipeline;
 pub mod worker;
 
 pub use config::VoiceManagerConfig;

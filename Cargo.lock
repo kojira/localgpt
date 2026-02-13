@@ -3279,6 +3279,7 @@ dependencies = [
  "fs2",
  "futures",
  "glob",
+ "hex",
  "hmac",
  "hound",
  "json5",
