@@ -3352,6 +3352,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
+ "audiopus",
  "axum",
  "base64 0.22.1",
  "chrono",

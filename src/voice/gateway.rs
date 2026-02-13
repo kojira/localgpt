@@ -4,10 +4,10 @@
 //! using `ConnectionInfo` built from raw Gateway events forwarded
 //! by the existing text-gateway in `src/discord/`.
 //!
-//! Songbird is configured with `DecodeMode::Decode`, `Channels::Stereo`,
-//! and `SampleRate::Hz48000` (matching Discord's native Opus format).
-//! The receiver downmixes stereo → mono and resamples 48 kHz → 16 kHz
-//! before forwarding to the STT pipeline.
+//! Songbird is configured with `DecodeMode::Pass` so raw Opus packets
+//! are forwarded to the receiver without driver-side decoding.
+//! The receiver decodes Opus → PCM via audiopus, then downmixes
+//! stereo → mono and resamples 48 kHz → 16 kHz for the STT pipeline.
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -93,17 +93,15 @@ pub struct VoiceServerData {
 
 // ─── Songbird configuration ────────────────────────────────────────
 
-/// Build a songbird Config that decodes received audio at Discord's native
-/// 48 kHz stereo rate.  Stereo→mono downmix and 48→16 kHz resampling happen
-/// in [`super::receiver::VoiceReceiveHandler`].
+/// Build a songbird Config with `DecodeMode::Pass` so raw Opus packets are
+/// forwarded to the receiver without driver-side decoding.  The receiver
+/// handles Opus decoding via audiopus, then downmixes and resamples.
 fn songbird_receive_config() -> songbird::Config {
-    use songbird::driver::{Channels, DecodeMode, SampleRate};
+    use songbird::driver::DecodeMode;
     use std::time::Duration;
 
     songbird::Config::default()
-        .decode_mode(DecodeMode::Decode)
-        .decode_channels(Channels::Stereo)
-        .decode_sample_rate(SampleRate::Hz48000)
+        .decode_mode(DecodeMode::Pass)
         .driver_timeout(Some(Duration::from_secs(30)))
 }
 
@@ -769,8 +767,8 @@ mod tests {
     }
 
     #[test]
-    fn songbird_receive_config_has_decode_mode() {
+    fn songbird_receive_config_uses_pass_mode() {
         let _config = songbird_receive_config();
-        // Config is built without panic
+        // Config is built without panic — uses DecodeMode::Pass
     }
 }

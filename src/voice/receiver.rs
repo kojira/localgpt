@@ -1,16 +1,20 @@
 //! Voice receive handler.
 //!
-//! Receives decoded PCM audio from songbird's VoiceTick events and
-//! forwards [`AudioChunk`]s to the dispatcher via an mpsc channel.
-//!
-//! Songbird is configured with `DecodeMode::Decode`, `Channels::Stereo`,
-//! and `SampleRate::Hz48000` (matching Discord's native Opus format).
-//! This handler downmixes stereo → mono and resamples 48 kHz → 16 kHz
-//! before forwarding to the STT pipeline.
+//! Receives raw Opus packets from songbird's VoiceTick events
+//! (configured with `DecodeMode::Pass`) and decodes them manually
+//! via audiopus. The decoded 48 kHz stereo PCM is then downmixed
+//! to mono and resampled to 16 kHz before forwarding [`AudioChunk`]s
+//! to the dispatcher via an mpsc channel.
 
+use audiopus::packet::Packet as OpusPacket;
+use audiopus::MutSignals;
 use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
+use std::sync::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+
+/// Maximum Opus frame size: 120 ms @ 48 kHz stereo = 5760 samples × 2 channels.
+const MAX_OPUS_FRAME_SAMPLES: usize = 5760 * 2;
 
 /// A chunk of decoded audio from a single speaker.
 #[derive(Debug, Clone)]
@@ -24,16 +28,31 @@ pub struct AudioChunk {
 /// songbird `EventHandler` implementation for receiving voice packets.
 ///
 /// Registered on the Call/Driver as a `CoreEvent::VoiceTick` handler.
-/// Each tick (every 20 ms) delivers decoded audio for all speaking users.
+/// Each tick (every 20 ms) delivers raw Opus packets for all speaking users.
+/// This handler decodes Opus → i16 PCM (48 kHz stereo) via audiopus,
+/// converts to f32, downmixes stereo → mono, and resamples 48 kHz → 16 kHz.
 pub struct VoiceReceiveHandler {
     /// Channel to send audio chunks to the dispatcher
     audio_tx: mpsc::UnboundedSender<AudioChunk>,
+    /// Opus decoder (48 kHz stereo). Mutex-wrapped because `act()` takes `&self`
+    /// but audiopus::coder::Decoder requires `&mut self` to decode.
+    opus_decoder: Mutex<audiopus::coder::Decoder>,
 }
 
 impl VoiceReceiveHandler {
-    /// Create a new receive handler.
+    /// Create a new receive handler with an Opus decoder configured for
+    /// 48 kHz stereo (matching Discord's native Opus format).
     pub fn new(audio_tx: mpsc::UnboundedSender<AudioChunk>) -> Self {
-        Self { audio_tx }
+        let decoder = audiopus::coder::Decoder::new(
+            audiopus::SampleRate::Hz48000,
+            audiopus::Channels::Stereo,
+        )
+        .expect("Failed to create Opus decoder");
+
+        Self {
+            audio_tx,
+            opus_decoder: Mutex::new(decoder),
+        }
     }
 }
 
@@ -42,44 +61,99 @@ impl VoiceEventHandler for VoiceReceiveHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::VoiceTick(tick) = ctx {
             for (&ssrc, data) in &tick.speaking {
-                if let Some(pcm_i16) = &data.decoded_voice {
-                    if pcm_i16.is_empty() {
+                // In DecodeMode::Pass, raw RTP data is in `data.packet`
+                let rtp_data = match &data.packet {
+                    Some(rtp) => rtp,
+                    None => continue,
+                };
+
+                // Extract Opus payload from the RTP packet
+                let raw = &rtp_data.packet;
+                let end = raw.len().saturating_sub(rtp_data.payload_end_pad);
+                if rtp_data.payload_offset >= end {
+                    continue;
+                }
+                let opus_payload = &raw[rtp_data.payload_offset..end];
+                if opus_payload.is_empty() {
+                    continue;
+                }
+
+                // Wrap as audiopus Packet
+                let opus_pkt = match OpusPacket::try_from(opus_payload) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(ssrc, "Invalid Opus packet: {}", e);
                         continue;
                     }
+                };
 
-                    // Convert i16 → f32 (range −1.0 … 1.0)
-                    let pcm_f32: Vec<f32> =
-                        pcm_i16.iter().map(|&s| s as f32 / 32768.0).collect();
-
-                    // Downmix stereo → mono (average L and R channels)
-                    let mono = stereo_to_mono(&pcm_f32);
-
-                    // Resample 48 kHz → 16 kHz
-                    let resampled = match super::audio::resample_mono(&mono, 48000, 16000) {
-                        Ok(v) => v,
+                // Decode Opus → interleaved i16 PCM (48 kHz stereo)
+                let pcm_i16 = {
+                    let mut decoder = match self.opus_decoder.lock() {
+                        Ok(d) => d,
                         Err(e) => {
-                            warn!(ssrc, "Resample failed: {}", e);
+                            warn!(ssrc, "Opus decoder lock poisoned: {}", e);
                             continue;
                         }
                     };
-
-                    let rms = calculate_rms(&resampled);
-
-                    debug!(
-                        ssrc,
-                        raw_samples = pcm_f32.len(),
-                        out_samples = resampled.len(),
-                        rms = format!("{:.4}", rms),
-                        "Received audio (48kHz stereo → 16kHz mono)"
-                    );
-
-                    let chunk = AudioChunk {
-                        ssrc,
-                        pcm: resampled,
+                    let mut buf = vec![0i16; MAX_OPUS_FRAME_SAMPLES];
+                    let mut_signals = match MutSignals::try_from(buf.as_mut_slice()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(ssrc, "MutSignals creation failed: {}", e);
+                            continue;
+                        }
                     };
-                    if let Err(e) = self.audio_tx.send(chunk) {
-                        warn!("Failed to send audio chunk: {}", e);
+                    match decoder.decode(Some(opus_pkt), mut_signals, false) {
+                        Ok(decoded_samples) => {
+                            // decoded_samples is per-channel; stereo = samples * 2 interleaved
+                            buf.truncate(decoded_samples * 2);
+                            buf
+                        }
+                        Err(e) => {
+                            warn!(ssrc, "Opus decode failed: {}", e);
+                            continue;
+                        }
                     }
+                };
+
+                if pcm_i16.is_empty() {
+                    continue;
+                }
+
+                // Convert i16 → f32 (range −1.0 … 1.0)
+                let pcm_f32: Vec<f32> =
+                    pcm_i16.iter().map(|&s| s as f32 / 32768.0).collect();
+
+                // Downmix stereo → mono (average L and R channels)
+                let mono = stereo_to_mono(&pcm_f32);
+
+                // Resample 48 kHz → 16 kHz
+                let resampled = match super::audio::resample_mono(&mono, 48000, 16000) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(ssrc, "Resample failed: {}", e);
+                        continue;
+                    }
+                };
+
+                let rms = calculate_rms(&resampled);
+
+                debug!(
+                    ssrc,
+                    opus_bytes = opus_payload.len(),
+                    decoded_samples = pcm_i16.len(),
+                    out_samples = resampled.len(),
+                    rms = format!("{:.4}", rms),
+                    "Decoded Opus → 48kHz stereo → 16kHz mono"
+                );
+
+                let chunk = AudioChunk {
+                    ssrc,
+                    pcm: resampled,
+                };
+                if let Err(e) = self.audio_tx.send(chunk) {
+                    warn!("Failed to send audio chunk: {}", e);
                 }
             }
         }
@@ -143,8 +217,25 @@ mod tests {
     fn voice_receive_handler_new() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let handler = VoiceReceiveHandler::new(tx);
-        // Verify construction succeeds
+        // Verify construction succeeds (Opus decoder created)
         let _ = handler;
+    }
+
+    #[test]
+    fn opus_decoder_plc() {
+        // Packet loss concealment: passing None should produce silence samples.
+        let mut decoder = audiopus::coder::Decoder::new(
+            audiopus::SampleRate::Hz48000,
+            audiopus::Channels::Stereo,
+        )
+        .expect("decoder creation");
+
+        let mut buf = vec![0i16; MAX_OPUS_FRAME_SAMPLES];
+        let signals = MutSignals::try_from(buf.as_mut_slice()).unwrap();
+        let result = decoder.decode(None::<OpusPacket<'_>>, signals, false);
+        assert!(result.is_ok());
+        let samples = result.unwrap();
+        assert!(samples > 0);
     }
 
     #[test]
