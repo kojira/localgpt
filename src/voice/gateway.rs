@@ -4,10 +4,10 @@
 //! using `ConnectionInfo` built from raw Gateway events forwarded
 //! by the existing text-gateway in `src/discord/`.
 //!
-//! Songbird is configured with `DecodeMode::Decode`, `Channels::Mono`,
-//! and `SampleRate::Hz16000` so that VoiceTick events deliver
-//! 16 kHz mono i16 PCM directly — no manual Opus decoding or
-//! resampling needed.
+//! Songbird is configured with `DecodeMode::Decode`, `Channels::Stereo`,
+//! and `SampleRate::Hz48000` (matching Discord's native Opus format).
+//! The receiver downmixes stereo → mono and resamples 48 kHz → 16 kHz
+//! before forwarding to the STT pipeline.
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -93,15 +93,17 @@ pub struct VoiceServerData {
 
 // ─── Songbird configuration ────────────────────────────────────────
 
-/// Build a songbird Config that decodes received audio to 16 kHz mono.
+/// Build a songbird Config that decodes received audio at Discord's native
+/// 48 kHz stereo rate.  Stereo→mono downmix and 48→16 kHz resampling happen
+/// in [`super::receiver::VoiceReceiveHandler`].
 fn songbird_receive_config() -> songbird::Config {
     use songbird::driver::{Channels, DecodeMode, SampleRate};
     use std::time::Duration;
 
     songbird::Config::default()
         .decode_mode(DecodeMode::Decode)
-        .decode_channels(Channels::Mono)
-        .decode_sample_rate(SampleRate::Hz16000)
+        .decode_channels(Channels::Stereo)
+        .decode_sample_rate(SampleRate::Hz48000)
         .driver_timeout(Some(Duration::from_secs(30)))
 }
 

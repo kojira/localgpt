@@ -3,10 +3,10 @@
 //! Receives decoded PCM audio from songbird's VoiceTick events and
 //! forwards [`AudioChunk`]s to the dispatcher via an mpsc channel.
 //!
-//! Songbird is configured with `DecodeMode::Decode`, `Channels::Mono`,
-//! and `SampleRate::Hz16000`, so the audio arrives as 16 kHz mono i16
-//! PCM — exactly what the STT pipeline needs. No manual Opus decoding
-//! or resampling is required.
+//! Songbird is configured with `DecodeMode::Decode`, `Channels::Stereo`,
+//! and `SampleRate::Hz48000` (matching Discord's native Opus format).
+//! This handler downmixes stereo → mono and resamples 48 kHz → 16 kHz
+//! before forwarding to the STT pipeline.
 
 use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
 use tokio::sync::mpsc;
@@ -51,18 +51,31 @@ impl VoiceEventHandler for VoiceReceiveHandler {
                     let pcm_f32: Vec<f32> =
                         pcm_i16.iter().map(|&s| s as f32 / 32768.0).collect();
 
-                    let rms = calculate_rms(&pcm_f32);
+                    // Downmix stereo → mono (average L and R channels)
+                    let mono = stereo_to_mono(&pcm_f32);
+
+                    // Resample 48 kHz → 16 kHz
+                    let resampled = match super::audio::resample_mono(&mono, 48000, 16000) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(ssrc, "Resample failed: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let rms = calculate_rms(&resampled);
 
                     debug!(
                         ssrc,
-                        samples = pcm_f32.len(),
+                        raw_samples = pcm_f32.len(),
+                        out_samples = resampled.len(),
                         rms = format!("{:.4}", rms),
-                        "Received audio"
+                        "Received audio (48kHz stereo → 16kHz mono)"
                     );
 
                     let chunk = AudioChunk {
                         ssrc,
-                        pcm: pcm_f32,
+                        pcm: resampled,
                     };
                     if let Err(e) = self.audio_tx.send(chunk) {
                         warn!("Failed to send audio chunk: {}", e);
@@ -72,6 +85,14 @@ impl VoiceEventHandler for VoiceReceiveHandler {
         }
         None
     }
+}
+
+/// Downmix interleaved stereo to mono by averaging L and R channels.
+fn stereo_to_mono(interleaved: &[f32]) -> Vec<f32> {
+    interleaved
+        .chunks_exact(2)
+        .map(|pair| (pair[0] + pair[1]) * 0.5)
+        .collect()
 }
 
 /// Calculate RMS (root mean square) of audio samples.
@@ -142,11 +163,34 @@ mod tests {
     }
 
     #[test]
-    fn resample_ratio() {
-        // With songbird configured to decode at 16kHz mono,
-        // no resampling is needed. This test documents the sample counts.
-        // 20ms @ 16kHz mono = 320 samples
-        let samples_per_tick = 16000 * 20 / 1000;
-        assert_eq!(samples_per_tick, 320);
+    fn stereo_to_mono_downmix() {
+        // L=1.0, R=0.0 → 0.5
+        let stereo = vec![1.0f32, 0.0, 0.6, 0.4, -0.5, 0.5];
+        let mono = stereo_to_mono(&stereo);
+        assert_eq!(mono.len(), 3);
+        assert!((mono[0] - 0.5).abs() < f32::EPSILON);
+        assert!((mono[1] - 0.5).abs() < f32::EPSILON);
+        assert!((mono[2] - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn stereo_to_mono_empty() {
+        let mono = stereo_to_mono(&[]);
+        assert!(mono.is_empty());
+    }
+
+    #[test]
+    fn sample_counts_per_tick() {
+        // 20ms @ 48kHz stereo = 960 samples/ch × 2 = 1920 interleaved
+        let interleaved_per_tick = 48000 * 20 / 1000 * 2;
+        assert_eq!(interleaved_per_tick, 1920);
+
+        // After stereo→mono: 960 mono samples
+        let mono_per_tick = interleaved_per_tick / 2;
+        assert_eq!(mono_per_tick, 960);
+
+        // After 48→16 kHz resample: ~320 samples (16000 * 20 / 1000)
+        let expected_output = 16000 * 20 / 1000;
+        assert_eq!(expected_output, 320);
     }
 }
