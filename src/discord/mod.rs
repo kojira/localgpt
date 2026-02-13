@@ -33,7 +33,12 @@ const OP_HELLO: u8 = 10;
 const OP_HEARTBEAT_ACK: u8 = 11;
 
 /// Intents: GUILDS (1<<0) + GUILD_MESSAGES (1<<9) + MESSAGE_CONTENT (1<<15)
+/// + GUILD_VOICE_STATES (1<<7) when voice feature is enabled
+#[cfg(not(feature = "voice"))]
 const INTENTS: u64 = 33280;
+
+#[cfg(feature = "voice")]
+const INTENTS: u64 = 33408; // 33280 + 128 (GUILD_VOICE_STATES)
 
 type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
 type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
@@ -130,6 +135,24 @@ struct ChannelDetail {
     guild_id: Option<String>,
 }
 
+// ─── Voice Gateway payloads ──────────────────────────────────────────
+#[cfg(feature = "voice")]
+#[derive(Debug, Deserialize)]
+struct VoiceStateUpdatePayload {
+    guild_id: Option<String>,
+    channel_id: Option<String>,
+    user_id: String,
+    session_id: String,
+}
+
+#[cfg(feature = "voice")]
+#[derive(Debug, Deserialize)]
+struct VoiceServerUpdatePayload {
+    guild_id: String,
+    token: String,
+    endpoint: Option<String>,
+}
+
 // ─── Queued message ─────────────────────────────────────────────────
 
 struct QueuedMessage {
@@ -160,6 +183,8 @@ pub struct DiscordBot {
     last_error_sent: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
     queue_tx: mpsc::Sender<QueuedMessage>,
     queue_rx: Option<mpsc::Receiver<QueuedMessage>>,
+    #[cfg(feature = "voice")]
+    voice_manager: Option<Arc<crate::voice::VoiceManager>>,
 }
 
 impl DiscordBot {
@@ -183,6 +208,8 @@ impl DiscordBot {
             last_error_sent: Arc::new(std::sync::Mutex::new(HashMap::new())),
             queue_tx,
             queue_rx: Some(queue_rx),
+            #[cfg(feature = "voice")]
+            voice_manager: None,
         })
     }
 
@@ -818,6 +845,62 @@ impl DiscordBot {
             }
             "RESUMED" => {
                 info!("Session resumed successfully");
+            }
+            #[cfg(feature = "voice")]
+            "VOICE_STATE_UPDATE" => {
+                if let Some(d) = data {
+                    match serde_json::from_value::<VoiceStateUpdatePayload>(d) {
+                        Ok(vsu) => {
+                            debug!("Voice State Update: {:?}", vsu);
+                            if let Some(ref vm) = self.voice_manager {
+                                let guild_id = vsu
+                                    .guild_id
+                                    .as_deref()
+                                    .and_then(|s| s.parse::<u64>().ok())
+                                    .unwrap_or(0);
+                                let channel_id = vsu
+                                    .channel_id
+                                    .as_deref()
+                                    .and_then(|s| s.parse::<u64>().ok());
+                                let user_id =
+                                    vsu.user_id.parse::<u64>().unwrap_or(0);
+                                let data = crate::voice::VoiceStateData {
+                                    guild_id,
+                                    channel_id,
+                                    user_id,
+                                    session_id: vsu.session_id,
+                                };
+                                vm.handle_voice_state_update(data).await;
+                            }
+                        }
+                        Err(e) => error!("Failed to parse VOICE_STATE_UPDATE: {}", e),
+                    }
+                }
+            }
+            #[cfg(feature = "voice")]
+            "VOICE_SERVER_UPDATE" => {
+                if let Some(d) = data {
+                    match serde_json::from_value::<VoiceServerUpdatePayload>(d) {
+                        Ok(vsu) => {
+                            debug!("Voice Server Update: {:?}", vsu);
+                            if let Some(ref vm) = self.voice_manager {
+                                let guild_id =
+                                    vsu.guild_id.parse::<u64>().unwrap_or(0);
+                                if let Some(endpoint) = vsu.endpoint {
+                                    let data = crate::voice::VoiceServerData {
+                                        guild_id,
+                                        token: vsu.token,
+                                        endpoint,
+                                    };
+                                    vm.handle_voice_server_update(data).await;
+                                } else {
+                                    warn!("Voice Server Update has no endpoint");
+                                }
+                            }
+                        }
+                        Err(e) => error!("Failed to parse VOICE_SERVER_UPDATE: {}", e),
+                    }
+                }
             }
             _ => {
                 debug!("Unhandled event: {}", event_name);
@@ -1538,6 +1621,27 @@ pub async fn start(
     let mut bot = DiscordBot::new(config.clone())?;
     let agents = agents.unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
     info!("Starting Discord bot");
+
+    let handle = tokio::spawn(async move {
+        if let Err(e) = bot.run_with_agents(agents).await {
+            error!("Discord bot exited with error: {}", e);
+        }
+    });
+
+    Ok(handle)
+}
+
+/// Start the Discord bot with an optional VoiceManager for voice support.
+#[cfg(feature = "voice")]
+pub async fn start_with_voice(
+    config: &Config,
+    agents: Option<SharedAgentMap>,
+    voice_manager: Option<Arc<crate::voice::VoiceManager>>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let mut bot = DiscordBot::new(config.clone())?;
+    bot.voice_manager = voice_manager;
+    let agents = agents.unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+    info!("Starting Discord bot (with voice support)");
 
     let handle = tokio::spawn(async move {
         if let Err(e) = bot.run_with_agents(agents).await {
