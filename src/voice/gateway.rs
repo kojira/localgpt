@@ -4,7 +4,7 @@
 //! using `ConnectionInfo` built from raw Gateway events forwarded
 //! by the existing text-gateway in `src/discord/`.
 //!
-//! Songbird is configured with `DecodeMode::Pass` so raw Opus packets
+//! Songbird is configured with `DecodeMode::Decrypt` so raw Opus packets
 //! are forwarded to the receiver without driver-side decoding.
 //! The receiver decodes Opus → PCM via audiopus, then downmixes
 //! stereo → mono and resamples 48 kHz → 16 kHz for the STT pipeline.
@@ -93,7 +93,7 @@ pub struct VoiceServerData {
 
 // ─── Songbird configuration ────────────────────────────────────────
 
-/// Build a songbird Config with `DecodeMode::Pass` so raw Opus packets are
+/// Build a songbird Config with `DecodeMode::Decrypt` so raw Opus packets are
 /// forwarded to the receiver without driver-side decoding.  The receiver
 /// handles Opus decoding via audiopus, then downmixes and resamples.
 fn songbird_receive_config() -> songbird::Config {
@@ -101,7 +101,7 @@ fn songbird_receive_config() -> songbird::Config {
     use std::time::Duration;
 
     songbird::Config::default()
-        .decode_mode(DecodeMode::Pass)
+        .decode_mode(DecodeMode::Decrypt)
         .driver_timeout(Some(Duration::from_secs(30)))
 }
 
@@ -767,8 +767,8 @@ mod tests {
     }
 
     #[test]
-    fn songbird_receive_config_uses_pass_mode() {
+    fn songbird_receive_config_uses_decrypt_mode() {
         let _config = songbird_receive_config();
-        // Config is built without panic — uses DecodeMode::Pass
+        // Config is built without panic — uses DecodeMode::Decrypt
     }
 }
