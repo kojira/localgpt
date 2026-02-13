@@ -113,6 +113,8 @@ pub struct VoiceGateway {
     bot_user_id: u64,
     /// Pending Voice State Update data (waiting for Voice Server Update)
     pending_voice_states: DashMap<u64, VoiceStateData>,
+    /// Pending Voice Server Update data (waiting for Voice State Update)
+    pending_voice_servers: DashMap<u64, VoiceServerData>,
     /// Connection state per guild
     connection_states: DashMap<u64, VcConnectionState>,
     /// Songbird standalone Call per guild
@@ -127,6 +129,7 @@ impl VoiceGateway {
         Self {
             bot_user_id,
             pending_voice_states: DashMap::new(),
+            pending_voice_servers: DashMap::new(),
             connection_states: DashMap::new(),
             calls: DashMap::new(),
             audio_tx,
@@ -184,12 +187,16 @@ impl VoiceGateway {
 
         // Clean up pending state
         self.pending_voice_states.remove(&guild_id);
+        self.pending_voice_servers.remove(&guild_id);
 
         info!(guild_id, "Left voice channel");
         Ok(())
     }
 
     /// Handle Voice State Update from Discord Gateway.
+    ///
+    /// Stores the session_id. If a pending Voice Server Update is already
+    /// available for this guild, triggers connection immediately.
     pub async fn handle_voice_state_update(&self, data: VoiceStateData) {
         // Ignore updates for other users (we only care about our own bot)
         if data.user_id != self.bot_user_id {
@@ -201,6 +208,7 @@ impl VoiceGateway {
             info!(guild_id = data.guild_id, "Bot was disconnected from VC");
             let _ = self.transition(data.guild_id, VcConnectionState::Disconnected);
             self.pending_voice_states.remove(&data.guild_id);
+            self.pending_voice_servers.remove(&data.guild_id);
             // Clean up the Call
             if let Some((_, call_arc)) = self.calls.remove(&data.guild_id) {
                 let mut call = call_arc.lock().await;
@@ -213,21 +221,47 @@ impl VoiceGateway {
         let guild_id = data.guild_id;
         self.pending_voice_states.insert(guild_id, data);
         info!(guild_id, "Voice State Update received (session stored)");
+
+        // If Voice Server Update already arrived, connect now
+        if self.pending_voice_servers.contains_key(&guild_id) {
+            self.try_connect(guild_id).await;
+        }
     }
 
     /// Handle Voice Server Update from Discord Gateway.
     ///
-    /// When both Voice State Update and Voice Server Update are received,
-    /// builds a `ConnectionInfo` and connects via songbird's standalone driver.
+    /// Stores endpoint + token. If a pending Voice State Update (session_id)
+    /// is already available for this guild, triggers connection immediately.
     pub async fn handle_voice_server_update(&self, data: VoiceServerData) {
-        // Get the corresponding Voice State Update
-        let state = match self.pending_voice_states.remove(&data.guild_id) {
-            Some((_, state)) => state,
+        let guild_id = data.guild_id;
+        self.pending_voice_servers.insert(guild_id, data);
+        info!(guild_id, "Voice Server Update received (endpoint+token stored)");
+
+        // If Voice State Update already arrived, connect now
+        if self.pending_voice_states.contains_key(&guild_id) {
+            self.try_connect(guild_id).await;
+        } else {
+            debug!(
+                guild_id,
+                "Waiting for Voice State Update before connecting"
+            );
+        }
+    }
+
+    /// Attempt to connect when both Voice State and Voice Server data are available.
+    ///
+    /// Consumes both pending entries and builds a `ConnectionInfo` for songbird.
+    async fn try_connect(&self, guild_id: u64) {
+        // Take both pending entries — both must be present
+        let state = match self.pending_voice_states.remove(&guild_id) {
+            Some((_, s)) => s,
+            None => return,
+        };
+        let server = match self.pending_voice_servers.remove(&guild_id) {
+            Some((_, s)) => s,
             None => {
-                warn!(
-                    guild_id = data.guild_id,
-                    "Voice Server Update received without prior Voice State Update"
-                );
+                // Put state back — server hasn't arrived yet
+                self.pending_voice_states.insert(guild_id, state);
                 return;
             }
         };
@@ -235,16 +269,13 @@ impl VoiceGateway {
         let channel_id = match state.channel_id {
             Some(cid) => cid,
             None => {
-                warn!(
-                    guild_id = data.guild_id,
-                    "Voice State has no channel_id"
-                );
+                warn!(guild_id, "Voice State has no channel_id");
                 return;
             }
         };
 
         // Build songbird ConnectionInfo
-        let guild_nz = match NonZeroU64::new(data.guild_id) {
+        let guild_nz = match NonZeroU64::new(guild_id) {
             Some(v) => v,
             None => {
                 error!("guild_id is zero");
@@ -262,22 +293,22 @@ impl VoiceGateway {
 
         // Sanitise endpoint: songbird expects bare host:port, but Discord
         // sometimes sends "wss://host:port" or "host:port/" variants.
-        let endpoint = data
+        let endpoint = server
             .endpoint
             .trim()
             .strip_prefix("wss://")
-            .unwrap_or(&data.endpoint)
+            .unwrap_or(&server.endpoint)
             .trim_end_matches('/')
             .to_string();
 
         debug!(
-            guild_id = data.guild_id,
+            guild_id,
             %endpoint,
             session_id = %state.session_id,
-            token_len = data.token.len(),
+            token_len = server.token.len(),
             user_id = self.bot_user_id,
             channel_id,
-            "Building ConnectionInfo for songbird"
+            "Building ConnectionInfo for songbird (both events received)"
         );
 
         let connection_info = ConnectionInfo {
@@ -285,14 +316,14 @@ impl VoiceGateway {
             endpoint,
             guild_id: GuildId(guild_nz),
             session_id: state.session_id.clone(),
-            token: data.token.clone(),
+            token: server.token.clone(),
             user_id: UserId(user_nz),
         };
 
         // Create or get the standalone Call for this guild
         let call_arc = self
             .calls
-            .entry(data.guild_id)
+            .entry(guild_id)
             .or_insert_with(|| {
                 let config = songbird_receive_config();
                 let mut call = Call::standalone_from_config(
@@ -305,7 +336,7 @@ impl VoiceGateway {
                 let handler = VoiceReceiveHandler::new(self.audio_tx.clone());
                 call.add_global_event(Event::Core(CoreEvent::VoiceTick), handler);
 
-                info!(guild_id = data.guild_id, "Created songbird standalone Call");
+                info!(guild_id, "Created songbird standalone Call");
                 Arc::new(Mutex::new(call))
             })
             .clone();
@@ -320,26 +351,26 @@ impl VoiceGateway {
             Ok(()) => {
                 // Transition: Connecting → Connected
                 if let Err(e) = self.transition(
-                    data.guild_id,
+                    guild_id,
                     VcConnectionState::Connected {
-                        guild_id: data.guild_id,
+                        guild_id,
                         channel_id,
                         connected_at: Instant::now(),
                     },
                 ) {
-                    error!(guild_id = data.guild_id, error = %e, "State transition failed");
+                    error!(guild_id, error = %e, "State transition failed");
                     return;
                 }
                 info!(
-                    guild_id = data.guild_id,
+                    guild_id,
                     channel_id,
                     "Voice connected via songbird standalone driver"
                 );
             }
             Err(e) => {
-                error!(guild_id = data.guild_id, error = %e, "Failed to connect to voice");
-                let _ = self.transition(data.guild_id, VcConnectionState::Disconnected);
-                self.calls.remove(&data.guild_id);
+                error!(guild_id, error = %e, "Failed to connect to voice");
+                let _ = self.transition(guild_id, VcConnectionState::Disconnected);
+                self.calls.remove(&guild_id);
             }
         }
     }
@@ -424,6 +455,7 @@ impl VoiceGateway {
         self.calls.clear();
         self.connection_states.clear();
         self.pending_voice_states.clear();
+        self.pending_voice_servers.clear();
     }
 }
 
@@ -686,10 +718,52 @@ mod tests {
             token: "tok".to_string(),
             endpoint: "wss://example.com".to_string(),
         };
-        // Should warn and return without error
+        // Should store server data and wait for Voice State Update
         gw.handle_voice_server_update(data).await;
-        // State unchanged
+        // Server data stored, state unchanged (no connect yet)
+        assert!(gw.pending_voice_servers.contains_key(&1));
         assert_eq!(gw.get_state(1), VcConnectionState::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn handle_voice_server_update_first_then_state() {
+        let gw = VoiceGateway::new(100, make_audio_tx());
+
+        // Voice Server Update arrives first
+        let server = VoiceServerData {
+            guild_id: 1,
+            token: "tok".to_string(),
+            endpoint: "wss://example.com".to_string(),
+        };
+        gw.handle_voice_server_update(server).await;
+        assert!(gw.pending_voice_servers.contains_key(&1));
+        // No connect yet
+        assert_eq!(gw.get_state(1), VcConnectionState::Disconnected);
+
+        // Set up Connecting state (would happen from join())
+        let _ = gw.transition(
+            1,
+            VcConnectionState::Connecting {
+                started_at: Instant::now(),
+                guild_id: 1,
+                channel_id: 2,
+            },
+        );
+
+        // Voice State Update arrives second — try_connect will run
+        // (will fail to actually connect because there's no real Discord
+        //  voice server, but both pending maps should be consumed)
+        let state = VoiceStateData {
+            guild_id: 1,
+            channel_id: Some(2),
+            user_id: 100,
+            session_id: "sess".to_string(),
+        };
+        gw.handle_voice_state_update(state).await;
+
+        // Both pending entries consumed by try_connect
+        assert!(!gw.pending_voice_states.contains_key(&1));
+        assert!(!gw.pending_voice_servers.contains_key(&1));
     }
 
     #[test]
