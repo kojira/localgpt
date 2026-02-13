@@ -114,6 +114,15 @@ pub struct VoicePipelineConfig {
     /// Idle timeout in seconds (0 = disabled)
     #[serde(default = "default_voice_idle_timeout")]
     pub idle_timeout_sec: u64,
+
+    /// Multi-user context window duration in milliseconds.
+    /// STT finals within this window are batched into a single LLM request.
+    #[serde(default = "default_voice_context_window_ms")]
+    pub context_window_ms: u64,
+
+    /// Automatically enable context window when multiple users are present.
+    #[serde(default = "default_true")]
+    pub context_window_auto: bool,
 }
 
 impl Default for VoicePipelineConfig {
@@ -121,6 +130,8 @@ impl Default for VoicePipelineConfig {
         Self {
             interrupt_enabled: true,
             idle_timeout_sec: default_voice_idle_timeout(),
+            context_window_ms: default_voice_context_window_ms(),
+            context_window_auto: true,
         }
     }
 }
@@ -130,6 +141,10 @@ pub struct VoiceSttConfig {
     #[serde(default = "default_voice_stt_provider")]
     pub provider: String,
 
+    /// Maximum number of concurrent STT sessions (1–8, default: 4).
+    #[serde(default = "default_voice_stt_max_concurrent")]
+    pub max_concurrent_sessions: usize,
+
     #[serde(default)]
     pub ws: VoiceSttWsConfig,
 }
@@ -138,6 +153,7 @@ impl Default for VoiceSttConfig {
     fn default() -> Self {
         Self {
             provider: default_voice_stt_provider(),
+            max_concurrent_sessions: default_voice_stt_max_concurrent(),
             ws: VoiceSttWsConfig::default(),
         }
     }
@@ -753,6 +769,12 @@ fn default_voice_stt_sample_rate() -> u32 {
 }
 fn default_voice_playback_prebuffer() -> u32 {
     100
+}
+fn default_voice_stt_max_concurrent() -> usize {
+    4
+}
+fn default_voice_context_window_ms() -> u64 {
+    2000
 }
 
 impl Default for AgentConfig {

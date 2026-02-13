@@ -6,12 +6,15 @@
 pub mod agent_bridge;
 pub mod audio;
 pub mod config;
+pub mod context_window;
 pub mod dispatcher;
 pub mod gateway;
+pub mod lrs;
 pub mod playback;
 pub mod provider;
 pub mod receiver;
 pub mod splitter;
+pub mod ssrc_map;
 pub mod transcript;
 pub mod tts_cache;
 pub mod tts_pipeline;
