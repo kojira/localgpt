@@ -53,6 +53,12 @@ impl VoiceManager {
     ///
     /// Creates the audio channel and songbird standalone driver config.
     pub fn init_gateway(&mut self, bot_user_id: u64) {
+        // Install the rustls ring crypto provider before songbird uses TLS.
+        // The call is idempotent — .ok() ignores AlreadyInstalled errors.
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
         let (audio_tx, audio_rx) = mpsc::unbounded_channel();
         let gateway = VoiceGateway::new(bot_user_id, audio_tx);
         self.gateway = Some(Arc::new(gateway));
