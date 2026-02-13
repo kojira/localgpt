@@ -169,6 +169,10 @@ pub struct VoiceSttWsConfig {
 
     #[serde(default = "default_voice_stt_max_reconnect")]
     pub max_reconnect_attempts: u32,
+
+    /// Whisper temperature (0.0 = greedy, default: 0.0).
+    #[serde(default)]
+    pub temperature: f64,
 }
 
 impl Default for VoiceSttWsConfig {
@@ -177,6 +181,7 @@ impl Default for VoiceSttWsConfig {
             endpoint: default_voice_stt_ws_endpoint(),
             reconnect_interval_ms: default_voice_stt_reconnect_interval(),
             max_reconnect_attempts: default_voice_stt_max_reconnect(),
+            temperature: 0.0,
         }
     }
 }
