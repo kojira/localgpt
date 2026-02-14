@@ -29,12 +29,10 @@ pub use receiver::AudioChunk;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use agent_bridge::MockAgentBridge;
 use dispatcher::Dispatcher;
-use provider::tts::mock::MockTtsProvider;
-use provider::TtsProvider;
 
 /// Top-level voice subsystem manager.
 /// Owns the gateway, dispatcher, and worker lifecycle.
@@ -83,15 +81,15 @@ impl VoiceManager {
         let stt_provider = provider::stt::create_stt_provider(&self.config.voice.stt)?;
         info!("STT provider created: {}", stt_provider.name());
 
-        // Create mock TTS provider for now (actual TTS is a separate concern)
-        let tts_provider: Arc<dyn TtsProvider> = Arc::new(MockTtsProvider::silent());
+        // Create TTS provider from config
+        let tts_provider = provider::tts::create_tts_provider(&self.config.voice.tts)?;
         info!("TTS provider created: {}", tts_provider.name());
 
-        // Create mock agent bridge for now
+        // Create mock agent bridge for now (echoes input as "echo: {text}")
         let agent_bridge = Arc::new(MockAgentBridge::new());
-        info!("Agent bridge created (mock)");
+        info!("Agent bridge created (mock echo)");
 
-        // Create audio output channel (can be logged/discarded for now)
+        // Create audio output channel for TTS playback
         let (audio_output_tx, mut audio_output_rx) = mpsc::unbounded_channel();
 
         // Create dispatcher
@@ -107,10 +105,30 @@ impl VoiceManager {
         );
         info!("Dispatcher created");
 
-        // Spawn task to consume audio_output (discard for now)
+        // Spawn task to play TTS audio output via songbird
+        let gateway_for_playback = self.gateway.clone();
+        let playback_guild_id = self
+            .config
+            .voice
+            .discord
+            .auto_join
+            .first()
+            .and_then(|aj| aj.guild_id.parse::<u64>().ok());
         tokio::spawn(async move {
-            while let Some((_user_id, _audio)) = audio_output_rx.recv().await {
-                // Audio output is logged but discarded for now (no playback wired yet)
+            while let Some((_user_id, audio)) = audio_output_rx.recv().await {
+                if audio.is_empty() {
+                    continue;
+                }
+                if let (Some(gw), Some(gid)) = (&gateway_for_playback, playback_guild_id) {
+                    let sample_count = audio.len();
+                    if let Err(e) = gw.play_audio(gid, audio).await {
+                        warn!("Failed to play TTS audio: {}", e);
+                    } else {
+                        info!(guild_id = gid, samples = sample_count, "Playing TTS audio");
+                    }
+                } else {
+                    warn!("No gateway or guild_id for TTS playback");
+                }
             }
         });
 
