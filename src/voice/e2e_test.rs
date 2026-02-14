@@ -641,8 +641,20 @@ mod tests {
         in_tx.send(trigger_audio()).unwrap();
 
         // Empty STT text should not produce audio output.
+        // Either the recv times out (no output) or the worker exits and the
+        // channel closes (Ok(None)).  Both are acceptable — only a real audio
+        // chunk means failure.
         let result = tokio::time::timeout(Duration::from_millis(500), out_rx.recv()).await;
-        assert!(result.is_err(), "Empty STT text should not trigger TTS");
+        match result {
+            Err(_) => {} // Timeout — no audio produced, correct.
+            Ok(None) => {} // Worker exited, channel closed — no audio, correct.
+            Ok(Some((_, audio))) => {
+                panic!(
+                    "Empty STT text should not trigger TTS, got {} samples",
+                    audio.len()
+                );
+            }
+        }
 
         drop(in_tx);
         handle.await.unwrap().unwrap();

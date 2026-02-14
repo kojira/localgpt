@@ -1,165 +1,420 @@
 //! Voice receive handler.
 //!
-//! Receives raw Opus packets from songbird's VoiceTick events
-//! (configured with `DecodeMode::Pass`) and decodes them manually
-//! via audiopus. The decoded 48 kHz stereo PCM is then downmixed
-//! to mono and resampled to 16 kHz before forwarding [`AudioChunk`]s
-//! to the dispatcher via an mpsc channel.
+//! Receives decoded PCM from songbird's VoiceTick events
+//! (configured with `DecodeMode::Decode`). The decoded 48 kHz stereo PCM
+//! is then downmixed to 48 kHz mono before forwarding
+//! [`AudioChunk`]s to the dispatcher via an mpsc channel.
+//!
+//! Also handles `SpeakingStateUpdate` events to maintain the SSRC → UserId
+//! mapping, and `ClientDisconnect` to clean up user state.
 
-use audiopus::packet::Packet as OpusPacket;
-use audiopus::MutSignals;
+use chrono::Local;
+use rubato::{
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
-use std::sync::Mutex;
+use std::sync::{atomic::AtomicBool, atomic::AtomicU32, atomic::Ordering, Arc, Mutex};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-/// Maximum Opus frame size: 120 ms @ 48 kHz stereo = 5760 samples × 2 channels.
-const MAX_OPUS_FRAME_SAMPLES: usize = 5760 * 2;
+use super::ssrc_map::SsrcUserMap;
+
+/// Global instance counter for VoiceReceiveHandler instances
+static INSTANCE_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// A chunk of decoded audio from a single speaker.
 #[derive(Debug, Clone)]
 pub struct AudioChunk {
     /// Synchronization source — identifies the speaker.
     pub ssrc: u32,
-    /// 16 kHz mono f32 PCM samples.
+    /// Discord user ID resolved from the SSRC map (None if not yet mapped).
+    pub user_id: Option<u64>,
+    /// Discord username resolved from the SSRC map (None if not yet mapped).
+    pub user_name: Option<String>,
+    /// 16 kHz mono f32 PCM samples (resampled from 48 kHz).
     pub pcm: Vec<f32>,
+}
+
+/// Shared inner state for the voice receive handler.
+///
+/// Wrapped in `Arc` so that a single `VoiceReceiveHandler` can be cloned
+/// and registered for multiple event types while sharing state.
+struct InnerReceiver {
+    /// Channel to send audio chunks to the dispatcher
+    audio_tx: mpsc::UnboundedSender<AudioChunk>,
+    /// SSRC → (UserId, username) mapping, updated by SpeakingStateUpdate events
+    ssrc_map: SsrcUserMap,
+    /// WAV writer for debug logging (16 kHz mono 16-bit PCM, resampled from 48 kHz)
+    wav_writer: Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>,
+    /// WAV writer for 48 kHz stereo debug logging
+    wav_writer_48k_stereo: Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>,
+    /// Persistent resampler for 48 kHz → 16 kHz mono conversion
+    resampler: Mutex<Option<SincFixedIn<f32>>>,
+    /// Flag to track if we're currently recording (once per session)
+    recording: AtomicBool,
+    /// SSRC of the current speaker being recorded
+    recording_ssrc: Mutex<Option<u32>>,
+    /// Count of consecutive silent ticks (at 20ms/tick, 100 = 2 seconds of silence)
+    silent_tick_count: AtomicU32,
+    /// Unique instance identifier
+    instance_id: u32,
+    /// Counter to limit act() logging (only logs first 10 calls per instance)
+    log_count: AtomicU32,
 }
 
 /// songbird `EventHandler` implementation for receiving voice packets.
 ///
-/// Registered on the Call/Driver as a `CoreEvent::VoiceTick` handler.
-/// Each tick (every 20 ms) delivers raw Opus packets for all speaking users.
-/// This handler decodes Opus → i16 PCM (48 kHz stereo) via audiopus,
-/// converts to f32, downmixes stereo → mono, and resamples 48 kHz → 16 kHz.
+/// Handles multiple event types via a single shared instance:
+/// - `VoiceTick`: Processes decoded PCM (downmix stereo→mono, resample 48→16 kHz)
+/// - `SpeakingStateUpdate`: Maintains SSRC → UserId mapping
+/// - `ClientDisconnect`: Cleans up user state from SSRC map
+///
+/// Clone this handler and register the same instance for all needed event types.
+#[derive(Clone)]
 pub struct VoiceReceiveHandler {
-    /// Channel to send audio chunks to the dispatcher
-    audio_tx: mpsc::UnboundedSender<AudioChunk>,
-    /// Opus decoder (48 kHz stereo). Mutex-wrapped because `act()` takes `&self`
-    /// but audiopus::coder::Decoder requires `&mut self` to decode.
-    opus_decoder: Mutex<audiopus::coder::Decoder>,
+    inner: Arc<InnerReceiver>,
 }
 
 impl VoiceReceiveHandler {
-    /// Create a new receive handler with an Opus decoder configured for
-    /// 48 kHz stereo (matching Discord's native Opus format).
+    /// Create a new receive handler.
     pub fn new(audio_tx: mpsc::UnboundedSender<AudioChunk>) -> Self {
-        let decoder = audiopus::coder::Decoder::new(
-            audiopus::SampleRate::Hz48000,
-            audiopus::Channels::Stereo,
-        )
-        .expect("Failed to create Opus decoder");
-
         Self {
-            audio_tx,
-            opus_decoder: Mutex::new(decoder),
+            inner: Arc::new(InnerReceiver {
+                audio_tx,
+                ssrc_map: SsrcUserMap::new(),
+                wav_writer: Mutex::new(None),
+                wav_writer_48k_stereo: Mutex::new(None),
+                resampler: Mutex::new(None),
+                recording: AtomicBool::new(false),
+                recording_ssrc: Mutex::new(None),
+                silent_tick_count: AtomicU32::new(0),
+                instance_id: INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed),
+                log_count: AtomicU32::new(0),
+            }),
         }
+    }
+}
+
+impl InnerReceiver {
+    /// Get or initialize the resampler for 48 kHz → 16 kHz conversion.
+    fn get_or_init_resampler(&self) -> std::sync::MutexGuard<'_, Option<SincFixedIn<f32>>> {
+        let mut guard = self.resampler.lock().unwrap();
+        if guard.is_none() {
+            let params = SincInterpolationParameters {
+                sinc_len: 256,
+                f_cutoff: 0.95,
+                interpolation: SincInterpolationType::Linear,
+                oversampling_factor: 256,
+                window: WindowFunction::BlackmanHarris2,
+            };
+            *guard = Some(SincFixedIn::<f32>::new(16000.0 / 48000.0, 2.0, params, 960, 1).unwrap());
+        }
+        guard
+    }
+
+    /// Initialize WAV writers for debug logging.
+    /// Returns tuple of (48kHz stereo, 16kHz mono) writers sharing the same timestamp.
+    fn init_wav_writers(
+        &self,
+    ) -> Result<
+        (
+            hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+            hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        info!(instance_id = self.instance_id, "init_wav_writers");
+        let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+
+        std::fs::create_dir_all("/Users/kojira/.localgpt/logs")?;
+
+        // 48kHz stereo writer
+        let filename_48k_stereo = format!("voice_48k_stereo_{}.wav", timestamp);
+        let wav_path_48k_stereo = std::path::PathBuf::from(format!(
+            "/Users/kojira/.localgpt/logs/{}",
+            filename_48k_stereo
+        ));
+        let spec_48k_stereo = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let file_48k_stereo = std::fs::File::create(&wav_path_48k_stereo)?;
+        let writer_48k_stereo =
+            hound::WavWriter::new(std::io::BufWriter::new(file_48k_stereo), spec_48k_stereo)?;
+
+        // 16kHz mono writer
+        let filename_debug = format!("voice_debug_{}.wav", timestamp);
+        let wav_path_debug = std::path::PathBuf::from(format!(
+            "/Users/kojira/.localgpt/logs/{}",
+            filename_debug
+        ));
+        let spec_debug = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let file_debug = std::fs::File::create(&wav_path_debug)?;
+        let writer_debug =
+            hound::WavWriter::new(std::io::BufWriter::new(file_debug), spec_debug)?;
+
+        Ok((writer_48k_stereo, writer_debug))
+    }
+
+    /// Handle a VoiceTick event: decode, downmix, resample, and send audio chunks.
+    fn handle_voice_tick(&self, tick: &songbird::events::context_data::VoiceTick) {
+        // Reset silent tick counter when speaking users are detected
+        if !tick.speaking.is_empty() {
+            self.silent_tick_count.store(0, Ordering::Relaxed);
+        }
+
+        // Handle silent users: increment silence counter and finalize if threshold reached
+        if !tick.silent.is_empty() && self.recording.load(Ordering::Relaxed) {
+            let new_count = self.silent_tick_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+            // Finalize WAV after 100 consecutive silent ticks (2 seconds at 20ms/tick)
+            if new_count >= 100 {
+                // Finalize both WAV writers
+                let mut finalized_count = 0;
+
+                if let Ok(mut writer_guard) = self.wav_writer_48k_stereo.lock() {
+                    if let Some(writer) = writer_guard.take() {
+                        match writer.finalize() {
+                            Ok(_) => finalized_count += 1,
+                            Err(e) => warn!("Failed to finalize 48k stereo WAV file: {}", e),
+                        }
+                    }
+                }
+
+                if let Ok(mut writer_guard) = self.wav_writer.lock() {
+                    if let Some(writer) = writer_guard.take() {
+                        match writer.finalize() {
+                            Ok(_) => {
+                                finalized_count += 1;
+                                info!(
+                                    instance_id = self.instance_id,
+                                    finalized_count, "finalized wav files"
+                                );
+                                self.recording.store(false, Ordering::Relaxed);
+                                self.silent_tick_count.store(0, Ordering::Relaxed);
+                                if let Ok(mut ssrc_guard) = self.recording_ssrc.lock() {
+                                    *ssrc_guard = None;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to finalize 48k mono WAV file: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (&ssrc, data) in &tick.speaking {
+            // Get decoded PCM from songbird (48 kHz stereo i16)
+            let pcm_i16 = match data.decoded_voice.as_ref() {
+                Some(v) => v,
+                None => continue,
+            };
+
+            if pcm_i16.is_empty() {
+                continue;
+            }
+
+            // Write 48kHz stereo to debug file if recording
+            if self.recording.load(Ordering::Relaxed) {
+                let recording_ssrc = self.recording_ssrc.lock().ok().and_then(|g| *g);
+                if recording_ssrc == Some(ssrc) {
+                    if let Ok(mut writer_guard) = self.wav_writer_48k_stereo.lock() {
+                        if let Some(ref mut writer) = *writer_guard {
+                            for &sample_i16 in pcm_i16 {
+                                if let Err(e) = writer.write_sample(sample_i16) {
+                                    warn!("Failed to write 48k stereo WAV sample: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Convert i16 → f32 (range −1.0 … 1.0)
+            let pcm_f32: Vec<f32> = pcm_i16.iter().map(|&s| s as f32 / 32768.0).collect();
+
+            // Downmix stereo → mono (average L and R channels)
+            let mono = stereo_to_mono(&pcm_f32);
+
+            // Resample mono from 48 kHz to 16 kHz
+            let mono_16k = {
+                let mut resampler_guard = self.get_or_init_resampler();
+                let resampler = resampler_guard.as_mut().unwrap();
+                let waves_in = vec![mono.clone()];
+                match resampler.process(&waves_in, None) {
+                    Ok(mut result) => result.remove(0),
+                    Err(e) => {
+                        warn!("Resample failed: {}", e);
+                        mono.clone()
+                    }
+                }
+            };
+
+            let rms = calculate_rms(&mono_16k);
+
+            debug!(
+                ssrc,
+                pcm_bytes = pcm_i16.len() * 2,
+                decoded_samples = pcm_i16.len(),
+                out_samples = mono_16k.len(),
+                rms = format!("{:.4}", rms),
+                "Decoded 48kHz stereo → 16kHz mono (resampled)"
+            );
+
+            // Write 16kHz mono to debug file if recording
+            if self.recording.load(Ordering::Relaxed) {
+                let recording_ssrc = self.recording_ssrc.lock().ok().and_then(|g| *g);
+                if recording_ssrc == Some(ssrc) {
+                    if let Ok(mut writer_guard) = self.wav_writer.lock() {
+                        if let Some(ref mut writer) = *writer_guard {
+                            for &sample_f32 in &mono_16k {
+                                let sample_i16 = (sample_f32 * 32767.0) as i16;
+                                if let Err(e) = writer.write_sample(sample_i16) {
+                                    warn!("Failed to write 16k WAV sample: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if !self.recording.load(Ordering::Relaxed) {
+                // Start recording on first speaking user
+                match self.init_wav_writers() {
+                    Ok((writer_48k_stereo, writer_debug)) => {
+                        if let Ok(mut writer_guard) = self.wav_writer_48k_stereo.lock() {
+                            *writer_guard = Some(writer_48k_stereo);
+                        }
+                        if let Ok(mut writer_guard) = self.wav_writer.lock() {
+                            *writer_guard = Some(writer_debug);
+                        }
+                        if let Ok(mut ssrc_guard) = self.recording_ssrc.lock() {
+                            *ssrc_guard = Some(ssrc);
+                        }
+                        self.recording.store(true, Ordering::Relaxed);
+                        debug!(ssrc, "Started WAV recording (48k stereo + 16k mono)");
+
+                        // Write this chunk to both new files
+                        // 48kHz stereo
+                        if let Ok(mut writer_guard) = self.wav_writer_48k_stereo.lock() {
+                            if let Some(ref mut writer) = *writer_guard {
+                                for &sample_i16 in pcm_i16 {
+                                    if let Err(e) = writer.write_sample(sample_i16) {
+                                        warn!("Failed to write 48k stereo WAV sample: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // 16kHz mono
+                        if let Ok(mut writer_guard) = self.wav_writer.lock() {
+                            if let Some(ref mut writer) = *writer_guard {
+                                for &sample_f32 in &mono_16k {
+                                    let sample_i16 = (sample_f32 * 32767.0) as i16;
+                                    if let Err(e) = writer.write_sample(sample_i16) {
+                                        warn!("Failed to write 16k WAV sample: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to initialize WAV writers: {}", e);
+                    }
+                }
+            }
+
+            // Resolve SSRC → (user_id, user_name) from the shared map
+            let (user_id, user_name) = match self.ssrc_map.get_user(ssrc) {
+                Some((uid, uname)) => (Some(uid), Some(uname)),
+                None => (None, None),
+            };
+
+            let chunk = AudioChunk {
+                ssrc,
+                user_id,
+                user_name,
+                pcm: mono_16k,
+            };
+            if let Err(e) = self.audio_tx.send(chunk) {
+                warn!("Failed to send audio chunk: {}", e);
+            }
+        }
+    }
+
+    /// Handle a SpeakingStateUpdate event: update SSRC → UserId mapping.
+    fn handle_speaking_state_update(
+        &self,
+        speaking: &songbird::model::payload::Speaking,
+    ) {
+        if let Some(user_id) = speaking.user_id {
+            let uid = user_id.0;
+            // We don't have the username from this event; use a placeholder
+            // that will be refined when the dispatcher receives it.
+            let username = format!("user_{}", uid);
+            self.ssrc_map
+                .update_from_speaking(speaking.ssrc, uid, username);
+            info!(
+                ssrc = speaking.ssrc,
+                user_id = uid,
+                "SSRC → UserId mapping updated from SpeakingStateUpdate"
+            );
+        }
+    }
+
+    /// Handle a ClientDisconnect event: remove user from SSRC map.
+    fn handle_client_disconnect(
+        &self,
+        disconnect: &songbird::model::payload::ClientDisconnect,
+    ) {
+        let uid = disconnect.user_id.0;
+        self.ssrc_map.remove_user(uid);
+        info!(
+            user_id = uid,
+            "User removed from SSRC map (ClientDisconnect)"
+        );
     }
 }
 
 #[async_trait::async_trait]
 impl VoiceEventHandler for VoiceReceiveHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        debug!("VoiceReceiveHandler::act called, ctx variant: {:?}", std::mem::discriminant(ctx));
-        if let EventContext::VoiceTick(tick) = ctx {
-            debug!("VoiceTick: speaking={} silent={}", tick.speaking.len(), tick.silent.len());
-            for (&ssrc, data) in &tick.speaking {
-                // In DecodeMode::Pass, raw RTP data is in `data.packet`
-                let rtp_data = match &data.packet {
-                    Some(rtp) => rtp,
-                    None => continue,
-                };
+        let count = self.inner.log_count.fetch_add(1, Ordering::Relaxed);
+        if count < 10 {
+            info!(
+                instance_id = self.inner.instance_id,
+                count,
+                event = ?std::mem::discriminant(ctx),
+                "act() called"
+            );
+        }
 
-                // Extract Opus payload from the RTP packet
-                let raw = &rtp_data.packet;
-                let end = raw.len().saturating_sub(rtp_data.payload_end_pad);
-                if rtp_data.payload_offset >= end {
-                    continue;
-                }
-                let opus_payload = &raw[rtp_data.payload_offset..end];
-                debug!("SSRC {} opus_payload size: {} bytes", ssrc, opus_payload.len());
-                if opus_payload.is_empty() {
-                    continue;
-                }
-
-                // Wrap as audiopus Packet
-                let opus_pkt = match OpusPacket::try_from(opus_payload) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!(ssrc, "Invalid Opus packet: {}", e);
-                        continue;
-                    }
-                };
-
-                // Decode Opus → interleaved i16 PCM (48 kHz stereo)
-                let pcm_i16 = {
-                    let mut decoder = match self.opus_decoder.lock() {
-                        Ok(d) => d,
-                        Err(e) => {
-                            warn!(ssrc, "Opus decoder lock poisoned: {}", e);
-                            continue;
-                        }
-                    };
-                    let mut buf = vec![0i16; MAX_OPUS_FRAME_SAMPLES];
-                    let mut_signals = match MutSignals::try_from(buf.as_mut_slice()) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!(ssrc, "MutSignals creation failed: {}", e);
-                            continue;
-                        }
-                    };
-                    match decoder.decode(Some(opus_pkt), mut_signals, false) {
-                        Ok(decoded_samples) => {
-                            // decoded_samples is per-channel; stereo = samples * 2 interleaved
-                            buf.truncate(decoded_samples * 2);
-                            buf
-                        }
-                        Err(e) => {
-                            warn!(ssrc, "Opus decode failed: {}", e);
-                            continue;
-                        }
-                    }
-                };
-
-                if pcm_i16.is_empty() {
-                    continue;
-                }
-
-                // Convert i16 → f32 (range −1.0 … 1.0)
-                let pcm_f32: Vec<f32> =
-                    pcm_i16.iter().map(|&s| s as f32 / 32768.0).collect();
-
-                // Downmix stereo → mono (average L and R channels)
-                let mono = stereo_to_mono(&pcm_f32);
-
-                // Resample 48 kHz → 16 kHz
-                let resampled = match super::audio::resample_mono(&mono, 48000, 16000) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(ssrc, "Resample failed: {}", e);
-                        continue;
-                    }
-                };
-
-                let rms = calculate_rms(&resampled);
-
-                debug!(
-                    ssrc,
-                    opus_bytes = opus_payload.len(),
-                    decoded_samples = pcm_i16.len(),
-                    out_samples = resampled.len(),
-                    rms = format!("{:.4}", rms),
-                    "Decoded Opus → 48kHz stereo → 16kHz mono"
-                );
-
-                let chunk = AudioChunk {
-                    ssrc,
-                    pcm: resampled,
-                };
-                if let Err(e) = self.audio_tx.send(chunk) {
-                    warn!("Failed to send audio chunk: {}", e);
-                }
+        match ctx {
+            EventContext::VoiceTick(tick) => {
+                self.inner.handle_voice_tick(tick);
+            }
+            EventContext::SpeakingStateUpdate(speaking) => {
+                self.inner.handle_speaking_state_update(speaking);
+            }
+            EventContext::ClientDisconnect(disconnect) => {
+                self.inner.handle_client_disconnect(disconnect);
+            }
+            _ => {
+                // RtpPacket, RtcpPacket, etc. — not needed for our pipeline
             }
         }
+
         None
     }
 }
@@ -189,10 +444,27 @@ mod tests {
     fn audio_chunk_fields() {
         let chunk = AudioChunk {
             ssrc: 12345,
+            user_id: Some(99999),
+            user_name: Some("Alice".to_string()),
             pcm: vec![0.1, 0.2, 0.3],
         };
         assert_eq!(chunk.ssrc, 12345);
+        assert_eq!(chunk.user_id, Some(99999));
+        assert_eq!(chunk.user_name.as_deref(), Some("Alice"));
         assert_eq!(chunk.pcm.len(), 3);
+    }
+
+    #[test]
+    fn audio_chunk_without_user_info() {
+        let chunk = AudioChunk {
+            ssrc: 12345,
+            user_id: None,
+            user_name: None,
+            pcm: vec![0.1, 0.2, 0.3],
+        };
+        assert_eq!(chunk.ssrc, 12345);
+        assert!(chunk.user_id.is_none());
+        assert!(chunk.user_name.is_none());
     }
 
     #[test]
@@ -220,25 +492,16 @@ mod tests {
     fn voice_receive_handler_new() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let handler = VoiceReceiveHandler::new(tx);
-        // Verify construction succeeds (Opus decoder created)
+        // Verify construction succeeds
         let _ = handler;
     }
 
     #[test]
-    fn opus_decoder_plc() {
-        // Packet loss concealment: passing None should produce silence samples.
-        let mut decoder = audiopus::coder::Decoder::new(
-            audiopus::SampleRate::Hz48000,
-            audiopus::Channels::Stereo,
-        )
-        .expect("decoder creation");
-
-        let mut buf = vec![0i16; MAX_OPUS_FRAME_SAMPLES];
-        let signals = MutSignals::try_from(buf.as_mut_slice()).unwrap();
-        let result = decoder.decode(None::<OpusPacket<'_>>, signals, false);
-        assert!(result.is_ok());
-        let samples = result.unwrap();
-        assert!(samples > 0);
+    fn voice_receive_handler_is_clone() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let handler = VoiceReceiveHandler::new(tx);
+        let _cloned = handler.clone();
+        // Both share the same inner state (Arc)
     }
 
     #[test]
@@ -279,12 +542,8 @@ mod tests {
         let interleaved_per_tick = 48000 * 20 / 1000 * 2;
         assert_eq!(interleaved_per_tick, 1920);
 
-        // After stereo→mono: 960 mono samples
+        // After stereo→mono: 960 mono samples @ 48kHz
         let mono_per_tick = interleaved_per_tick / 2;
         assert_eq!(mono_per_tick, 960);
-
-        // After 48→16 kHz resample: ~320 samples (16000 * 20 / 1000)
-        let expected_output = 16000 * 20 / 1000;
-        assert_eq!(expected_output, 320);
     }
 }

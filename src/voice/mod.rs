@@ -31,6 +31,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use agent_bridge::MockAgentBridge;
+use dispatcher::Dispatcher;
+use provider::tts::mock::MockTtsProvider;
+use provider::TtsProvider;
+
 /// Top-level voice subsystem manager.
 /// Owns the gateway, dispatcher, and worker lifecycle.
 pub struct VoiceManager {
@@ -64,6 +69,70 @@ impl VoiceManager {
         self.gateway = Some(Arc::new(gateway));
         self.audio_rx = Some(audio_rx);
         info!(bot_user_id, "Voice gateway initialized");
+    }
+
+    /// Start the voice pipeline: spawn a dispatcher task that reads from audio_rx
+    /// and routes audio chunks to per-user workers via STT → LLM → TTS.
+    pub async fn start_pipeline(&mut self) -> Result<()> {
+        let audio_rx = self
+            .audio_rx
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Audio receiver not available (already consumed?)"))?;
+
+        // Create STT provider from config
+        let stt_provider = provider::stt::create_stt_provider(&self.config.voice.stt)?;
+        info!("STT provider created: {}", stt_provider.name());
+
+        // Create mock TTS provider for now (actual TTS is a separate concern)
+        let tts_provider: Arc<dyn TtsProvider> = Arc::new(MockTtsProvider::silent());
+        info!("TTS provider created: {}", tts_provider.name());
+
+        // Create mock agent bridge for now
+        let agent_bridge = Arc::new(MockAgentBridge::new());
+        info!("Agent bridge created (mock)");
+
+        // Create audio output channel (can be logged/discarded for now)
+        let (audio_output_tx, mut audio_output_rx) = mpsc::unbounded_channel();
+
+        // Create dispatcher
+        let mut dispatcher = Dispatcher::new(
+            stt_provider,
+            tts_provider,
+            agent_bridge,
+            audio_output_tx,
+            None,
+            "LocalGPT".to_string(),
+            self.config.voice.pipeline.idle_timeout_sec,
+            self.config.voice.pipeline.interrupt_enabled,
+        );
+        info!("Dispatcher created");
+
+        // Spawn task to consume audio_output (discard for now)
+        tokio::spawn(async move {
+            while let Some((_user_id, _audio)) = audio_output_rx.recv().await {
+                // Audio output is logged but discarded for now (no playback wired yet)
+            }
+        });
+
+        // Spawn main dispatch loop
+        tokio::spawn(async move {
+            let mut audio_rx = audio_rx;
+            while let Some(chunk) = audio_rx.recv().await {
+                // Use the resolved user_id/user_name from the SSRC map
+                // (populated by SpeakingStateUpdate events in the receiver).
+                // Fall back to SSRC-based placeholder if not yet mapped.
+                let user_id = chunk.user_id.unwrap_or(chunk.ssrc as u64);
+                let user_name = chunk
+                    .user_name
+                    .unwrap_or_else(|| format!("user_{}", chunk.ssrc));
+
+                dispatcher.dispatch(user_id, user_name, chunk.pcm);
+            }
+            info!("Audio dispatcher loop ended");
+        });
+
+        info!("Voice pipeline started");
+        Ok(())
     }
 
     /// Start the voice subsystem (call from daemon).

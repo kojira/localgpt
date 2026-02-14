@@ -4,10 +4,9 @@
 //! using `ConnectionInfo` built from raw Gateway events forwarded
 //! by the existing text-gateway in `src/discord/`.
 //!
-//! Songbird is configured with `DecodeMode::Decrypt` so raw Opus packets
-//! are forwarded to the receiver without driver-side decoding.
-//! The receiver decodes Opus → PCM via audiopus, then downmixes
-//! stereo → mono and resamples 48 kHz → 16 kHz for the STT pipeline.
+//! Songbird is configured with `DecodeMode::Decode` so Opus packets
+//! are decoded to PCM at native 48 kHz stereo by the driver.
+//! The receiver downmixes stereo → mono and resamples 48 kHz → 16 kHz for the STT pipeline.
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -93,15 +92,15 @@ pub struct VoiceServerData {
 
 // ─── Songbird configuration ────────────────────────────────────────
 
-/// Build a songbird Config with `DecodeMode::Decrypt` so raw Opus packets are
-/// forwarded to the receiver without driver-side decoding.  The receiver
-/// handles Opus decoding via audiopus, then downmixes and resamples.
+/// Build a songbird Config with `DecodeMode::Decode` so Opus packets are
+/// decoded to PCM at native 48 kHz stereo by the driver.
+/// The receiver then downmixes and resamples.
 fn songbird_receive_config() -> songbird::Config {
     use songbird::driver::DecodeMode;
     use std::time::Duration;
 
     songbird::Config::default()
-        .decode_mode(DecodeMode::Decrypt)
+        .decode_mode(DecodeMode::Decode)
         .driver_timeout(Some(Duration::from_secs(30)))
 }
 
@@ -325,6 +324,7 @@ impl VoiceGateway {
             .calls
             .entry(guild_id)
             .or_insert_with(|| {
+                info!(guild_id, "DEBUG: or_insert_with closure ENTERED");
                 let config = songbird_receive_config();
                 let mut call = Call::standalone_from_config(
                     GuildId(guild_nz),
@@ -332,11 +332,19 @@ impl VoiceGateway {
                     config,
                 );
 
-                // Register VoiceTick handler for audio reception
-                let handler = VoiceReceiveHandler::new(self.audio_tx.clone());
-                call.add_global_event(Event::Core(CoreEvent::VoiceTick), handler);
+                info!(guild_id, "DEBUG: Call::standalone_from_config created");
+
+                // Register a single shared handler for all needed voice events.
+                // The handler is Clone (Arc-based) so all events share state
+                // (SSRC→UserId map, resampler, WAV writers, etc.).
+                let receiver = VoiceReceiveHandler::new(self.audio_tx.clone());
+                call.add_global_event(Event::Core(CoreEvent::VoiceTick), receiver.clone());
+                call.add_global_event(Event::Core(CoreEvent::SpeakingStateUpdate), receiver.clone());
+                call.add_global_event(Event::Core(CoreEvent::ClientDisconnect), receiver);
+                info!(guild_id, "Voice event handlers registered (VoiceTick, SpeakingStateUpdate, ClientDisconnect)");
 
                 info!(guild_id, "Created songbird standalone Call");
+                info!(guild_id, "DEBUG: or_insert_with closure DONE, returning Arc<Mutex<Call>>");
                 Arc::new(Mutex::new(call))
             })
             .clone();
@@ -346,6 +354,7 @@ impl VoiceGateway {
             let mut call = call_arc.lock().await;
             call.connect(connection_info).await
         };
+        info!(guild_id, ?connect_result, "DEBUG: call.connect() result");
 
         match connect_result {
             Ok(()) => {
@@ -767,8 +776,8 @@ mod tests {
     }
 
     #[test]
-    fn songbird_receive_config_uses_decrypt_mode() {
+    fn songbird_receive_config_uses_decode_mode() {
         let _config = songbird_receive_config();
-        // Config is built without panic — uses DecodeMode::Decrypt
+        // Config is built without panic — uses DecodeMode::Decode
     }
 }
