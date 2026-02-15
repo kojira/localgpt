@@ -10,6 +10,7 @@
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use songbird::id::{ChannelId, GuildId, UserId};
 use songbird::{Call, ConnectionInfo, CoreEvent, Event};
 use std::num::NonZeroU64;
@@ -19,6 +20,14 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use super::receiver::{AudioChunk, VoiceReceiveHandler};
+
+/// Probe that includes Ogg container support (for Ogg Opus from TTS API).
+/// Songbird's get_probe() only registers DCA; we need Ogg for format=opus.
+static OGG_OPUS_PROBE: Lazy<symphonia_core::probe::Probe> = Lazy::new(|| {
+    let mut probe = symphonia_core::probe::Probe::default();
+    probe.register_all::<symphonia_format_ogg::OggReader>();
+    probe
+});
 
 // ─── VC connection state machine ────────────────────────────────────
 
@@ -433,7 +442,8 @@ impl VoiceGateway {
 
     /// Play PCM f32 audio (48 kHz mono) through the songbird Call for a guild.
     ///
-    /// Converts PCM to WAV in-memory and feeds it to songbird's mixer.
+    /// Converts PCM to WAV in-memory and enqueues it so segments play in order
+    /// (builtin-queue). Input must be made playable via make_playable_async.
     /// Returns an error if the guild has no active Call.
     pub async fn play_audio(&self, guild_id: u64, pcm: Vec<f32>) -> Result<()> {
         let call_arc = self
@@ -445,11 +455,47 @@ impl VoiceGateway {
         let wav_bytes = crate::voice::audio::pcm_f32_to_wav_bytes(&pcm, 48000)
             .map_err(|e| anyhow::anyhow!("WAV encode failed: {}", e))?;
 
-        let input: songbird::input::Input = wav_bytes.into();
-        let mut call = call_arc.lock().await;
-        call.play_input(input);
+        let mut input: songbird::input::Input = wav_bytes.into();
+        input = input
+            .make_playable_async(
+                songbird::input::codecs::get_codec_registry(),
+                songbird::input::codecs::get_probe(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Make playable failed: {}", e))?;
 
-        debug!(guild_id, samples = pcm.len(), "Playing TTS audio via songbird");
+        let mut call = call_arc.lock().await;
+        call.enqueue_input(input).await;
+
+        debug!(guild_id, samples = pcm.len(), "Enqueued TTS audio via songbird");
+        Ok(())
+    }
+
+    /// Play pre-encoded Opus audio (e.g. Ogg Opus bytes from TTS API) through the songbird Call.
+    ///
+    /// Input is made playable via make_playable_async. Enqueued so segments play in order.
+    /// Returns an error if the guild has no active Call.
+    pub async fn play_audio_opus(&self, guild_id: u64, opus_bytes: Vec<u8>) -> Result<()> {
+        let len = opus_bytes.len();
+        let call_arc = self
+            .calls
+            .get(&guild_id)
+            .ok_or_else(|| anyhow::anyhow!("No active call for guild {}", guild_id))?
+            .clone();
+
+        let mut input: songbird::input::Input = opus_bytes.into();
+        input = input
+            .make_playable_async(
+                songbird::input::codecs::get_codec_registry(),
+                &*OGG_OPUS_PROBE,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Make playable failed (opus): {}", e))?;
+
+        let mut call = call_arc.lock().await;
+        call.enqueue_input(input).await;
+
+        debug!(guild_id, bytes = len, "Enqueued TTS Opus via songbird");
         Ok(())
     }
 

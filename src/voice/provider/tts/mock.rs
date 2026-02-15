@@ -109,7 +109,7 @@ impl TtsProvider for MockTtsProvider {
                 .collect(),
         };
 
-        Ok(TtsResult {
+        Ok(TtsResult::Pcm {
             audio,
             sample_rate: self.config.sample_rate,
             duration_ms,
@@ -130,9 +130,11 @@ mod tests {
         let provider = MockTtsProvider::silent();
         let result = provider.synthesize("hello").await.unwrap();
         // 5 chars * 150 ms/char = 750 ms
-        assert!((result.duration_ms - 750.0).abs() < f64::EPSILON);
-        // 24000 Hz * 0.75 s = 18000 samples
-        assert_eq!(result.audio.len(), 18000);
+        assert!((result.duration_ms() - 750.0).abs() < f64::EPSILON);
+        match &result {
+            TtsResult::Pcm { audio, .. } => assert_eq!(audio.len(), 18000),
+            _ => panic!("expected Pcm"),
+        }
     }
 
     #[tokio::test]
@@ -140,27 +142,30 @@ mod tests {
         let provider = MockTtsProvider::silent();
         let result = provider.synthesize("a").await.unwrap();
         // 1 char * 150 ms = 150 ms, clamped to min 200 ms
-        assert!((result.duration_ms - 200.0).abs() < f64::EPSILON);
+        assert!((result.duration_ms() - 200.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
     async fn sine_wave() {
         let provider = MockTtsProvider::sine(440.0);
         let result = provider.synthesize("hello").await.unwrap();
-        assert!(!result.audio.is_empty());
-        // Sine wave with amplitude 0.8 should exceed 0.4.
-        let max_amp = result
-            .audio
-            .iter()
-            .map(|s| s.abs())
-            .fold(0.0f32, f32::max);
-        assert!(max_amp > 0.4, "max amplitude was {}", max_amp);
+        match &result {
+            TtsResult::Pcm { audio, .. } => {
+                assert!(!audio.is_empty());
+                let max_amp = audio.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                assert!(max_amp > 0.4, "max amplitude was {}", max_amp);
+            }
+            _ => panic!("expected Pcm"),
+        }
     }
 
     #[tokio::test]
     async fn silent_all_zero() {
         let provider = MockTtsProvider::silent();
         let result = provider.synthesize("test").await.unwrap();
-        assert!(result.audio.iter().all(|&s| s == 0.0));
+        match &result {
+            TtsResult::Pcm { audio, .. } => assert!(audio.iter().all(|&s| s == 0.0)),
+            _ => panic!("expected Pcm"),
+        }
     }
 }

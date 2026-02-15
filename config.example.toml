@@ -181,11 +181,10 @@ file = "~/.localgpt/logs/agent.log"
 #
 # [voice.tts.aivis_speech]
 # endpoint = "http://127.0.0.1:10101"
-# style_id = 888753760
+# model = "default"
 # speed_scale = 1.0
-# pitch_scale = 0.0
-# intonation_scale = 1.0
 # volume_scale = 1.0
+# format = "wav"                 # "wav" (PCM) or "opus" (if your API supports it)
 #
 # [voice.agent]
 # # Override system prompt for voice sessions (optional)

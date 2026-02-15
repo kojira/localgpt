@@ -197,7 +197,10 @@ mod tests {
 
         let seg = rx.recv().await.unwrap().unwrap();
         // MockTtsProvider::silent() generates silence samples based on text length.
-        assert!(!seg.tts_result.audio.is_empty());
+        match &seg.tts_result {
+            crate::voice::provider::TtsResult::Pcm { audio, .. } => assert!(!audio.is_empty()),
+            crate::voice::provider::TtsResult::EncodedOpus { data, .. } => assert!(!data.is_empty()),
+        }
     }
 
     #[tokio::test]

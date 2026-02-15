@@ -23,7 +23,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
 use crate::config::VoiceSttWsConfig;
-use crate::voice::provider::{SttEvent, SttProvider, SttSession};
+use crate::voice::provider::{SttEvent, SttProvider, SttReceiver, SttSender};
 
 /// Initial config message sent to the STT server on connect.
 #[derive(Debug, Serialize)]
@@ -62,6 +62,11 @@ struct WsServerMessage {
     is_final: Option<bool>,
 }
 
+fn parse_server_message(text: &str) -> Option<SttEvent> {
+    let msg: WsServerMessage = serde_json::from_str(text).ok()?;
+    msg.into_stt_event()
+}
+
 impl WsServerMessage {
     /// Convert the raw server message into a typed [`SttEvent`].
     fn into_stt_event(self) -> Option<SttEvent> {
@@ -84,6 +89,20 @@ impl WsServerMessage {
             }),
             // Handle `transcript` events with `is_final` flag.
             "transcript" => {
+                let text = self.text.unwrap_or_default();
+                if self.is_final.unwrap_or(false) {
+                    Some(SttEvent::Final {
+                        text,
+                        language: self.language.unwrap_or_else(|| "ja".to_string()),
+                        confidence: self.confidence.unwrap_or(1.0),
+                        duration_ms: self.duration_ms.unwrap_or(0.0),
+                    })
+                } else {
+                    Some(SttEvent::Partial { text })
+                }
+            }
+            // Handle `result` (same as reference: type === 'result', is_final, text, duration_ms).
+            "result" => {
                 let text = self.text.unwrap_or_default();
                 if self.is_final.unwrap_or(false) {
                     Some(SttEvent::Final {
@@ -162,14 +181,16 @@ impl WsSttProvider {
 
 #[async_trait]
 impl SttProvider for WsSttProvider {
-    async fn connect(&self) -> Result<Box<dyn SttSession>> {
+    async fn connect(&self) -> Result<(Box<dyn SttSender>, Box<dyn SttReceiver>)> {
         let ws_stream = self.connect_with_retry().await?;
         let (mut sink, stream) = ws_stream.split();
 
-        // Send initial config.
+        // Send initial config. We always send 16 kHz PCM (from receiver resampler); the server
+        // must receive this rate or recognition will fail or never return results.
+        const PCM_SAMPLE_RATE: u32 = 16000;
         let config_msg = WsConfigMessage {
             msg_type: "config",
-            sample_rate: 48000,
+            sample_rate: PCM_SAMPLE_RATE,
             channels: 1,
             encoding: "pcm_s16le",
             language: "ja",
@@ -179,8 +200,12 @@ impl SttProvider for WsSttProvider {
         let json = serde_json::to_string(&config_msg)?;
         sink.send(Message::Text(json)).await?;
         debug!("sent STT config: {:?}", config_msg);
+        // Give server time to apply config (reference: onopen → send config then stream audio).
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
-        Ok(Box::new(WsSttSession { sink, stream }))
+        let sender = Box::new(WsSttSender { sink }) as Box<dyn SttSender>;
+        let receiver = Box::new(WsSttReceiver { stream }) as Box<dyn SttReceiver>;
+        Ok((sender, receiver))
     }
 
     fn name(&self) -> &str {
@@ -193,9 +218,13 @@ impl SttProvider for WsSttProvider {
 type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
-/// A single WebSocket STT session.
-struct WsSttSession {
+/// WebSocket STT sender (audio only).
+struct WsSttSender {
     sink: WsSink,
+}
+
+/// WebSocket STT receiver (events only).
+struct WsSttReceiver {
     stream: WsStream,
 }
 
@@ -211,7 +240,7 @@ pub(crate) fn pcm_f32_to_s16le(samples: &[f32]) -> Vec<u8> {
 }
 
 #[async_trait]
-impl SttSession for WsSttSession {
+impl SttSender for WsSttSender {
     async fn send_audio(&mut self, audio: &[f32]) -> Result<()> {
         let bytes = pcm_f32_to_s16le(audio);
         self.sink
@@ -221,53 +250,88 @@ impl SttSession for WsSttSession {
         Ok(())
     }
 
-    async fn recv_event(&mut self) -> Result<Option<SttEvent>> {
-        loop {
-            match self.stream.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let msg: WsServerMessage = serde_json::from_str(&text)
-                        .with_context(|| {
-                            format!("failed to parse STT server message: {text}")
-                        })?;
-                    if let Some(event) = msg.into_stt_event() {
-                        return Ok(Some(event));
-                    }
-                    // Unknown type — loop to next message.
-                }
-                Some(Ok(Message::Close(_))) => {
-                    debug!("STT WebSocket closed by server");
-                    return Ok(None);
-                }
-                Some(Ok(Message::Ping(data))) => {
-                    // Respond to pings to keep connection alive.
-                    let _ = self.sink.send(Message::Pong(data)).await;
-                }
-                Some(Ok(_)) => {
-                    // Ignore other message types (Binary, Pong, Frame).
-                }
-                Some(Err(e)) => {
-                    error!("STT WebSocket error: {e}");
-                    return Err(e.into());
-                }
-                None => {
-                    debug!("STT WebSocket stream ended");
-                    return Ok(None);
-                }
-            }
-        }
+    async fn send_end_of_stream(&mut self) -> Result<()> {
+        let eos = r#"{"type":"end_of_stream"}"#.to_string();
+        self.sink
+            .send(Message::Text(eos))
+            .await
+            .context("failed to send end_of_stream")?;
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<()> {
-        // Send end_of_stream signal.
-        let eos = r#"{"type":"end_of_stream"}"#.to_string();
-        if let Err(e) = self.sink.send(Message::Text(eos)).await {
-            debug!("failed to send end_of_stream (connection may already be closed): {e}");
-        }
-        // Close the WebSocket.
         if let Err(e) = self.sink.close().await {
             debug!("failed to close STT WebSocket: {e}");
         }
         Ok(())
+    }
+}
+
+fn log_stt_server_message(text: &str) {
+    const MAX: usize = 300;
+    let truncated: &str = if text.len() <= MAX { text } else { &text[..MAX] };
+    info!(msg = %truncated, "STT server recv");
+}
+
+#[async_trait]
+impl SttReceiver for WsSttReceiver {
+    async fn recv_event(&mut self) -> Result<Option<SttEvent>> {
+        loop {
+            match self.stream.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    #[cfg(test)]
+                    eprintln!("[STT recv] text: {}", text);
+                    log_stt_server_message(&text);
+                    if let Some(ev) = parse_server_message(&text) {
+                        return Ok(Some(ev));
+                    }
+                    if !text.contains("\"type\":\"config_ack\"") && !text.contains("\"type\": \"config_ack\"") {
+                        let preview: String = text.chars().take(150).collect();
+                        info!(msg = %preview, "STT server unparsed (ignored)");
+                    }
+                }
+                Some(Ok(Message::Binary(b))) => {
+                    if let Ok(text) = std::str::from_utf8(&b) {
+                        #[cfg(test)]
+                        eprintln!("[STT recv] binary as text: {}", text);
+                        log_stt_server_message(text);
+                        if let Some(ev) = parse_server_message(text) {
+                            return Ok(Some(ev));
+                        }
+                        if !text.contains("\"type\":\"config_ack\"") && !text.contains("\"type\": \"config_ack\"") {
+                            let preview: String = text.chars().take(150).collect();
+                            info!(msg = %preview, "STT server unparsed (ignored)");
+                        }
+                    } else {
+                        #[cfg(test)]
+                        eprintln!("[STT recv] binary (not UTF-8, {} bytes)", b.len());
+                        info!(bytes = b.len(), "STT server recv binary (not UTF-8)");
+                    }
+                }
+                Some(Ok(Message::Close(_))) => {
+                    #[cfg(test)]
+                    eprintln!("[STT recv] server sent Close");
+                    info!("STT WebSocket closed by server");
+                    return Ok(None);
+                }
+                Some(Ok(Message::Ping(_))) => {
+                    continue;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(e)) => {
+                    #[cfg(test)]
+                    eprintln!("[STT recv] error: {}", e);
+                    error!("STT WebSocket error: {e}");
+                    return Err(e.into());
+                }
+                None => {
+                    #[cfg(test)]
+                    eprintln!("[STT recv] stream ended (None)");
+                    info!("STT WebSocket stream ended");
+                    return Ok(None);
+                }
+            }
+        }
     }
 }
 
@@ -457,5 +521,158 @@ mod tests {
         assert_eq!(parsed["language"], "ja");
         assert_eq!(parsed["interim_results"], true);
         assert_eq!(parsed["temperature"], 0.0);
+    }
+}
+
+// ── STT server integration tests (problem isolation) ───────────────────────
+//
+// Load pre-generated speech from tests/fixtures/stt_speech.wav (create once
+// with curl; see tests/fixtures/README.md), send it to the STT server in 20ms
+// or 100ms chunks. Only the STT server need be running for the test.
+//
+//   cargo test --features voice -- stt_server_ -- --ignored --nocapture
+//
+// Evidence from these tests (which chunk size gets events, timeouts, etc.)
+// should guide any buffering or pipeline changes.
+
+#[cfg(test)]
+mod stt_server_tests {
+    use super::*;
+    use crate::config::{Config, VoiceSttWsConfig};
+    use crate::voice::audio::{pcm_i16_to_f32, resample_mono};
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// Load STT WS config from config.toml (voice.stt.ws). Uses default if voice section missing.
+    fn stt_ws_config_from_app_config() -> VoiceSttWsConfig {
+        match Config::load() {
+            Ok(c) => c
+                .voice
+                .as_ref()
+                .map(|v| v.stt.ws.clone())
+                .unwrap_or_else(VoiceSttWsConfig::default),
+            Err(_) => VoiceSttWsConfig::default(),
+        }
+    }
+
+    /// Load tests/fixtures/stt_speech.wav and return mono f32 PCM at the given sample rate.
+    /// Create the file once with the curl command in tests/fixtures/README.md.
+    fn load_speech_wav_at_rate(target_sample_rate: u32) -> Vec<f32> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stt_speech.wav");
+        let reader = hound::WavReader::open(&path).unwrap_or_else(|e| {
+            panic!(
+                "open {}: {}. Generate the fixture once (see tests/fixtures/README.md)",
+                path.display(),
+                e
+            )
+        });
+        let spec = reader.spec();
+        let samples_i16: Vec<i16> = reader
+            .into_samples::<i16>()
+            .collect::<Result<_, _>>()
+            .expect("read WAV samples");
+        let pcm_f32 = pcm_i16_to_f32(&samples_i16);
+        let mono: Vec<f32> = if spec.channels == 2 {
+            pcm_f32
+                .chunks_exact(2)
+                .map(|lr| (lr[0] + lr[1]) / 2.0)
+                .collect()
+        } else {
+            pcm_f32
+        };
+        resample_mono(&mono, spec.sample_rate, target_sample_rate)
+            .expect("resample to target rate")
+    }
+
+    /// Split PCM into chunks of the given size.
+    fn chunk_pcm(pcm: &[f32], samples_per_chunk: usize) -> Vec<Vec<f32>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < pcm.len() {
+            let end = (i + samples_per_chunk).min(pcm.len());
+            out.push(pcm[i..end].to_vec());
+            i = end;
+        }
+        out
+    }
+
+    /// Send fixture PCM in chunks, close sender, collect STT events until stream end or timeout.
+    /// Fails if no recognition event (Partial or Final) is received — i.e. asserts real STT.
+    async fn send_fixture_and_assert_recognition(
+        chunk_label: &str,
+        chunks: &[Vec<f32>],
+        config: VoiceSttWsConfig,
+    ) {
+        eprintln!("[STT test] endpoint={} sample_rate={}", config.endpoint, config.sample_rate);
+        let provider = WsSttProvider::new(config);
+        let (mut sender, mut receiver) = provider
+            .connect()
+            .await
+            .expect("connect (is STT server running? check voice.stt.ws.endpoint in config)");
+
+        for ch in chunks {
+            sender.send_audio(ch).await.expect("send_audio");
+        }
+        sender.send_end_of_stream().await.expect("send_end_of_stream");
+        eprintln!("[STT test] sent end_of_stream, waiting for results");
+
+        let mut events = Vec::new();
+        let recv_timeout = Duration::from_secs(10);
+        eprintln!("[STT test] entering recv loop (timeout {:?})", recv_timeout);
+        loop {
+            match tokio::time::timeout(recv_timeout, receiver.recv_event()).await {
+                Ok(Ok(Some(ev))) => {
+                    eprintln!("[STT server] {}: {:?}", chunk_label, ev);
+                    events.push(ev);
+                }
+                Ok(Ok(None)) => {
+                    eprintln!("[STT test] recv loop exit: got None (stream end)");
+                    break;
+                }
+                Ok(Err(e)) => panic!("recv_event error: {}", e),
+                Err(_) => {
+                    eprintln!("[STT test] recv loop exit: timeout after {:?}", recv_timeout);
+                    break;
+                }
+            }
+        }
+        sender.close().await.expect("close");
+
+        let has_recognition = events.iter().any(|e| {
+            matches!(e, SttEvent::Partial { .. } | SttEvent::Final { .. })
+        });
+        assert!(
+            has_recognition,
+            "STT server returned no recognition result (got {} events: {:?}); \
+             check server and voice.stt.ws.endpoint in config",
+            events.len(),
+            events
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "STT server + fixture required - run with: cargo test --features voice -- stt_server_ -- --ignored --nocapture"]
+    async fn stt_server_responds_to_20ms_chunks() {
+        let config = stt_ws_config_from_app_config();
+        let sample_rate = config.sample_rate;
+        let pcm = load_speech_wav_at_rate(sample_rate);
+        assert!(!pcm.is_empty(), "fixture WAV is empty");
+
+        let samples_20ms = (sample_rate as usize * 20) / 1000;
+        let chunks = chunk_pcm(&pcm, samples_20ms);
+        send_fixture_and_assert_recognition("20ms chunks", &chunks, config).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "STT server + fixture required - run with: cargo test --features voice -- stt_server_ -- --ignored --nocapture"]
+    async fn stt_server_responds_to_100ms_chunks() {
+        let config = stt_ws_config_from_app_config();
+        let sample_rate = config.sample_rate;
+        let pcm = load_speech_wav_at_rate(sample_rate);
+        assert!(!pcm.is_empty(), "fixture WAV is empty");
+
+        let samples_100ms = (sample_rate as usize * 100) / 1000;
+        let chunks = chunk_pcm(&pcm, samples_100ms);
+        send_fixture_and_assert_recognition("100ms chunks", &chunks, config).await;
     }
 }

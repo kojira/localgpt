@@ -46,8 +46,40 @@ impl AivisSpeechProvider {
 impl TtsProvider for AivisSpeechProvider {
     async fn synthesize(&self, text: &str) -> Result<TtsResult> {
         let base = self.config.endpoint.trim_end_matches('/');
+        let format = self.config.format.to_lowercase();
 
-        // POST /voice with query params
+        if format == "opus" {
+            let opus_bytes = self
+                .client
+                .post(format!("{}/voice", base))
+                .query(&[
+                    ("model", self.config.model.as_str()),
+                    ("text", text),
+                    ("speed", &self.config.speed_scale.to_string()),
+                    ("format", "opus"),
+                ])
+                .send()
+                .await
+                .context("voice request failed")?
+                .error_for_status()
+                .context("voice endpoint returned error status")?
+                .bytes()
+                .await
+                .context("failed to read voice response body")?;
+
+            debug!(
+                bytes = opus_bytes.len(),
+                model = %self.config.model,
+                "AivisSpeech Opus received"
+            );
+
+            return Ok(TtsResult::EncodedOpus {
+                data: opus_bytes.to_vec(),
+                duration_ms: 0.0,
+            });
+        }
+
+        // WAV path (default)
         let wav_bytes = self
             .client
             .post(format!("{}/voice", base))
@@ -66,7 +98,6 @@ impl TtsProvider for AivisSpeechProvider {
             .await
             .context("failed to read voice response body")?;
 
-        // Parse WAV → i16 samples + detect sample rate
         let (samples_i16, wav_sr) = Self::parse_wav(&wav_bytes)?;
 
         debug!(
@@ -77,10 +108,8 @@ impl TtsProvider for AivisSpeechProvider {
             "AivisSpeech WAV received"
         );
 
-        // Convert i16 → f32
         let mut samples_f32 = pcm_i16_to_f32(&samples_i16);
 
-        // Apply volume scale
         if (self.config.volume_scale - 1.0).abs() > f64::EPSILON {
             let vol = self.config.volume_scale as f32;
             for s in &mut samples_f32 {
@@ -88,7 +117,6 @@ impl TtsProvider for AivisSpeechProvider {
             }
         }
 
-        // Resample to 48 kHz for Discord playback
         let resampled = resample_mono(&samples_f32, wav_sr, 48000)
             .map_err(|e| anyhow::anyhow!("resampling failed: {}", e))?;
 
@@ -99,7 +127,7 @@ impl TtsProvider for AivisSpeechProvider {
             duration_ms, "AivisSpeech synthesis complete"
         );
 
-        Ok(TtsResult {
+        Ok(TtsResult::Pcm {
             audio: resampled,
             sample_rate: 48000,
             duration_ms,
@@ -251,6 +279,7 @@ mod tests {
             model: "testmodel".to_string(),
             speed_scale: 2.0,
             volume_scale: 0.7,
+            format: "wav".to_string(),
         };
         let provider = AivisSpeechProvider::new(config);
         assert_eq!(provider.config.endpoint, "http://localhost:9999");

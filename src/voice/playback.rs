@@ -124,7 +124,7 @@ mod tests {
         TtsSegment {
             index,
             text: text.to_string(),
-            tts_result: TtsResult {
+            tts_result: TtsResult::Pcm {
                 audio: vec![0.0; 100],
                 sample_rate: 48000,
                 duration_ms: 10.0,

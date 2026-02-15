@@ -14,10 +14,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
-use super::agent_bridge::AgentBridge;
+use super::agent_bridge::{AgentBridge, RoomMessage};
 use super::provider::{SttProvider, TtsProvider};
 use super::transcript::TranscriptEntry;
 use super::worker::PipelineWorker;
+use crate::voice::PlaybackAudio;
 
 /// Per-user worker state held by the dispatcher.
 struct WorkerState {
@@ -35,11 +36,15 @@ pub struct Dispatcher {
     stt_provider: Arc<dyn SttProvider>,
     tts_provider: Arc<dyn TtsProvider>,
     agent_bridge: Arc<dyn AgentBridge>,
-    audio_output_tx: mpsc::UnboundedSender<(u64, Vec<f32>)>,
+    audio_output_tx: mpsc::UnboundedSender<(u64, PlaybackAudio)>,
     transcript_tx: Option<mpsc::UnboundedSender<TranscriptEntry>>,
     bot_name: String,
     idle_timeout_sec: u64,
     interrupt_enabled: bool,
+    /// Min samples to buffer before sending to STT (None = use worker default).
+    stt_buffer_samples: Option<usize>,
+    /// When Some, workers send STT finals here for room-level batching (one LLM call per batch).
+    room_tx: Option<mpsc::UnboundedSender<RoomMessage>>,
 }
 
 impl Dispatcher {
@@ -47,11 +52,13 @@ impl Dispatcher {
         stt_provider: Arc<dyn SttProvider>,
         tts_provider: Arc<dyn TtsProvider>,
         agent_bridge: Arc<dyn AgentBridge>,
-        audio_output_tx: mpsc::UnboundedSender<(u64, Vec<f32>)>,
+        audio_output_tx: mpsc::UnboundedSender<(u64, PlaybackAudio)>,
         transcript_tx: Option<mpsc::UnboundedSender<TranscriptEntry>>,
         bot_name: String,
         idle_timeout_sec: u64,
         interrupt_enabled: bool,
+        stt_buffer_samples: Option<usize>,
+        room_tx: Option<mpsc::UnboundedSender<RoomMessage>>,
     ) -> Self {
         Self {
             workers: HashMap::new(),
@@ -63,6 +70,8 @@ impl Dispatcher {
             bot_name,
             idle_timeout_sec,
             interrupt_enabled,
+            stt_buffer_samples,
+            room_tx,
         }
     }
 
@@ -86,6 +95,10 @@ impl Dispatcher {
             let is_playing_clone = is_playing.clone();
             let cancel_clone = cancel.clone();
 
+            let stt_buffer_samples = self
+                .stt_buffer_samples
+                .unwrap_or(super::worker::STT_BUFFER_SAMPLES);
+            let room_tx = self.room_tx.clone();
             tokio::spawn(async move {
                 let mut worker = PipelineWorker::new(
                     user_id,
@@ -100,6 +113,8 @@ impl Dispatcher {
                     is_playing_clone,
                     cancel_clone,
                     idle_timeout_sec,
+                    stt_buffer_samples,
+                    room_tx,
                 );
                 match worker.run().await {
                     Ok(reason) => {
@@ -172,7 +187,7 @@ mod tests {
     use crate::voice::provider::tts::mock::MockTtsProvider;
     use std::time::Duration;
 
-    fn make_dispatcher() -> (Dispatcher, mpsc::UnboundedReceiver<(u64, Vec<f32>)>) {
+    fn make_dispatcher() -> (Dispatcher, mpsc::UnboundedReceiver<(u64, PlaybackAudio)>) {
         let stt: Arc<dyn SttProvider> = Arc::new(MockSttProvider::new(MockSttConfig {
             utterances: vec![MockUtterance {
                 text: "hello".to_string(),
@@ -189,7 +204,7 @@ mod tests {
         let bridge: Arc<dyn AgentBridge> = Arc::new(MockAgentBridge::new());
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         (
-            Dispatcher::new(stt, tts, bridge, out_tx, None, "Bot".to_string(), 300, true),
+            Dispatcher::new(stt, tts, bridge, out_tx, None, "Bot".to_string(), 300, true, Some(0), None),
             out_rx,
         )
     }
@@ -206,13 +221,13 @@ mod tests {
         // Dispatch audio for user 1.
         d.dispatch(1, "User1".to_string(), vec![0.1f32; 400]);
 
-        // Should receive TTS output from the spawned worker.
-        let (uid, audio) = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+        // Should receive TTS output from the spawned worker (mock returns PCM).
+        let (uid, playback) = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(uid, 1);
-        assert!(!audio.is_empty());
+        assert!(!playback.is_empty());
     }
 
     #[tokio::test]
@@ -249,6 +264,8 @@ mod tests {
             "TestBot".to_string(),
             300,
             true,
+            Some(0),
+            None,
         );
 
         d.dispatch(1, "Alice".to_string(), vec![0.1f32; 400]);
@@ -340,6 +357,8 @@ mod tests {
                 "Bot".to_string(),
                 300,
                 false,
+                Some(0),
+                None,
             );
 
             d.dispatch(1, "User1".to_string(), vec![0.1f32; 400]);

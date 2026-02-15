@@ -13,6 +13,7 @@ pub mod lrs;
 pub mod playback;
 pub mod provider;
 pub mod receiver;
+pub mod room_collector;
 pub mod splitter;
 pub mod ssrc_map;
 pub mod transcript;
@@ -31,8 +32,42 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use agent_bridge::MockAgentBridge;
+/// Audio payload for TTS playback: PCM (converted to WAV by gateway) or pre-encoded Opus.
+#[derive(Debug, Clone)]
+pub enum PlaybackAudio {
+    Pcm(Vec<f32>),
+    Opus(Vec<u8>),
+}
+
+impl PlaybackAudio {
+    /// True if the payload is empty (e.g. interrupt sent as Pcm(vec![])).
+    pub fn is_empty(&self) -> bool {
+        match self {
+            PlaybackAudio::Pcm(v) => v.is_empty(),
+            PlaybackAudio::Opus(v) => v.is_empty(),
+        }
+    }
+
+    /// Length in samples (Pcm) or bytes (Opus).
+    pub fn len(&self) -> usize {
+        match self {
+            PlaybackAudio::Pcm(v) => v.len(),
+            PlaybackAudio::Opus(v) => v.len(),
+        }
+    }
+
+    /// Reference to PCM samples if this is Pcm variant (for tests).
+    pub fn pcm_samples(&self) -> Option<&[f32]> {
+        match self {
+            PlaybackAudio::Pcm(v) => Some(v.as_slice()),
+            PlaybackAudio::Opus(_) => None,
+        }
+    }
+}
+
+use agent_bridge::{AgentBridge, MockAgentBridge, RoomMessage};
 use dispatcher::Dispatcher;
+use transcript::TranscriptEntry;
 
 /// Top-level voice subsystem manager.
 /// Owns the gateway, dispatcher, and worker lifecycle.
@@ -71,7 +106,15 @@ impl VoiceManager {
 
     /// Start the voice pipeline: spawn a dispatcher task that reads from audio_rx
     /// and routes audio chunks to per-user workers via STT → LLM → TTS.
-    pub async fn start_pipeline(&mut self) -> Result<()> {
+    ///
+    /// When `transcript_tx` is `Some`, workers will send transcript entries (user speech / bot response)
+    /// so the caller can post them to a Discord text channel or log.
+    /// When `agent_bridge` is `Some`, that bridge is used for LLM; otherwise a mock echo bridge is used.
+    pub async fn start_pipeline(
+        &mut self,
+        transcript_tx: Option<mpsc::UnboundedSender<TranscriptEntry>>,
+        agent_bridge: Option<Arc<dyn AgentBridge>>,
+    ) -> Result<()> {
         let audio_rx = self
             .audio_rx
             .take()
@@ -85,23 +128,55 @@ impl VoiceManager {
         let tts_provider = provider::tts::create_tts_provider(&self.config.voice.tts)?;
         info!("TTS provider created: {}", tts_provider.name());
 
-        // Create mock agent bridge for now (echoes input as "echo: {text}")
-        let agent_bridge = Arc::new(MockAgentBridge::new());
-        info!("Agent bridge created (mock echo)");
+        let agent_bridge = agent_bridge.unwrap_or_else(|| Arc::new(MockAgentBridge::new()));
+        info!("Agent bridge created");
 
-        // Create audio output channel for TTS playback
-        let (audio_output_tx, mut audio_output_rx) = mpsc::unbounded_channel();
+        // Create audio output channel for TTS playback (PCM or Opus)
+        let (audio_output_tx, mut audio_output_rx) = mpsc::unbounded_channel::<(u64, PlaybackAudio)>();
 
-        // Create dispatcher
+        let context_window_ms = self.config.voice.pipeline.context_window_ms;
+        let use_room = self.config.voice.pipeline.context_window_auto && context_window_ms > 0;
+        let (room_tx, room_rx) = if use_room {
+            let (tx, rx) = mpsc::unbounded_channel::<RoomMessage>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        if use_room {
+            let room_id = 0u64;
+            let bridge = agent_bridge.clone();
+            let tts = tts_provider.clone();
+            let out_tx = audio_output_tx.clone();
+            let tr_tx = transcript_tx.clone();
+            tokio::spawn(async move {
+                room_collector::run_room_collector(
+                    room_id,
+                    room_rx.unwrap(),
+                    bridge,
+                    tts,
+                    out_tx,
+                    tr_tx,
+                    "LocalGPT".to_string(),
+                    context_window_ms,
+                )
+                .await;
+            });
+            info!(context_window_ms, "Room collector started (multi-user batch)");
+        }
+
+        // Create dispatcher (transcript_tx = None → no transcript; caller can pass channel for VC-linked text channel)
         let mut dispatcher = Dispatcher::new(
             stt_provider,
             tts_provider,
             agent_bridge,
             audio_output_tx,
-            None,
+            transcript_tx,
             "LocalGPT".to_string(),
             self.config.voice.pipeline.idle_timeout_sec,
             self.config.voice.pipeline.interrupt_enabled,
+            None,
+            room_tx,
         );
         info!("Dispatcher created");
 
@@ -115,16 +190,31 @@ impl VoiceManager {
             .first()
             .and_then(|aj| aj.guild_id.parse::<u64>().ok());
         tokio::spawn(async move {
-            while let Some((_user_id, audio)) = audio_output_rx.recv().await {
-                if audio.is_empty() {
-                    continue;
-                }
+            while let Some((_user_id, playback)) = audio_output_rx.recv().await {
                 if let (Some(gw), Some(gid)) = (&gateway_for_playback, playback_guild_id) {
-                    let sample_count = audio.len();
-                    if let Err(e) = gw.play_audio(gid, audio).await {
-                        warn!("Failed to play TTS audio: {}", e);
-                    } else {
-                        info!(guild_id = gid, samples = sample_count, "Playing TTS audio");
+                    match playback {
+                        PlaybackAudio::Pcm(audio) => {
+                            if audio.is_empty() {
+                                continue;
+                            }
+                            let n = audio.len();
+                            if let Err(e) = gw.play_audio(gid, audio).await {
+                                warn!("Failed to play TTS audio: {}", e);
+                            } else {
+                                info!(guild_id = gid, samples = n, "Playing TTS audio");
+                            }
+                        }
+                        PlaybackAudio::Opus(data) => {
+                            if data.is_empty() {
+                                continue;
+                            }
+                            let n = data.len();
+                            if let Err(e) = gw.play_audio_opus(gid, data).await {
+                                warn!("Failed to play TTS Opus: {}", e);
+                            } else {
+                                info!(guild_id = gid, bytes = n, "Playing TTS Opus");
+                            }
+                        }
                     }
                 } else {
                     warn!("No gateway or guild_id for TTS playback");
@@ -135,6 +225,7 @@ impl VoiceManager {
         // Spawn main dispatch loop
         tokio::spawn(async move {
             let mut audio_rx = audio_rx;
+            let mut dispatch_count: u64 = 0;
             while let Some(chunk) = audio_rx.recv().await {
                 // Use the resolved user_id/user_name from the SSRC map
                 // (populated by SpeakingStateUpdate events in the receiver).
@@ -143,6 +234,19 @@ impl VoiceManager {
                 let user_name = chunk
                     .user_name
                     .unwrap_or_else(|| format!("user_{}", chunk.ssrc));
+
+                // Diagnostic: log first 20 dispatches to confirm data flow
+                if dispatch_count < 20 {
+                    info!(
+                        user_id,
+                        user_name,
+                        ssrc = chunk.ssrc,
+                        samples = chunk.pcm.len(),
+                        dispatch_count,
+                        "[B] Dispatching audio to worker"
+                    );
+                }
+                dispatch_count += 1;
 
                 dispatcher.dispatch(user_id, user_name, chunk.pcm);
             }

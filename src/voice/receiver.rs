@@ -22,6 +22,10 @@ use super::ssrc_map::SsrcUserMap;
 /// Global instance counter for VoiceReceiveHandler instances
 static INSTANCE_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Silence length per VoiceTick (20 ms at 16 kHz) so STT receives a continuous stream
+/// and can detect end-of-speech. Matches the resampled chunk size we send for speech.
+const SILENCE_SAMPLES_PER_TICK_16K: usize = 16000 * 20 / 1000;
+
 /// A chunk of decoded audio from a single speaker.
 #[derive(Debug, Clone)]
 pub struct AudioChunk {
@@ -247,6 +251,7 @@ impl InnerReceiver {
             let mono = stereo_to_mono(&pcm_f32);
 
             // Resample mono from 48 kHz to 16 kHz
+            let rms_before = calculate_rms(&mono);
             let mono_16k = {
                 let mut resampler_guard = self.get_or_init_resampler();
                 let resampler = resampler_guard.as_mut().unwrap();
@@ -261,6 +266,19 @@ impl InnerReceiver {
             };
 
             let rms = calculate_rms(&mono_16k);
+
+            // Diagnostic: compare RMS before/after resampling for audible chunks
+            if rms_before > 0.01 || rms > 0.01 {
+                info!(
+                    ssrc,
+                    pcm_i16_len = pcm_i16.len(),
+                    mono_len = mono.len(),
+                    mono_16k_len = mono_16k.len(),
+                    rms_before_resample = format!("{:.6}", rms_before),
+                    rms_after_resample = format!("{:.6}", rms),
+                    "[DIAG] Resample comparison (audible)"
+                );
+            }
 
             debug!(
                 ssrc,
@@ -341,14 +359,44 @@ impl InnerReceiver {
                 None => (None, None),
             };
 
+            let samples = mono_16k.len();
             let chunk = AudioChunk {
                 ssrc,
                 user_id,
                 user_name,
                 pcm: mono_16k,
             };
+            // Diagnostic: log chunks with audible audio (RMS > 0.01)
+            if rms > 0.01 {
+                info!(
+                    ssrc,
+                    ?user_id,
+                    samples,
+                    rms = format!("{:.4}", rms),
+                    "[A] AudioChunk with audio sending to dispatcher"
+                );
+            }
             if let Err(e) = self.audio_tx.send(chunk) {
                 warn!("Failed to send audio chunk: {}", e);
+            }
+        }
+
+        // Send silence for users in tick.silent so STT gets a continuous stream and can
+        // detect end-of-speech (emit final when it sees enough silence).
+        for &ssrc in &tick.silent {
+            let (user_id, user_name) = match self.ssrc_map.get_user(ssrc) {
+                Some((uid, uname)) => (Some(uid), Some(uname)),
+                None => continue,
+            };
+            let silence = vec![0.0f32; SILENCE_SAMPLES_PER_TICK_16K];
+            let chunk = AudioChunk {
+                ssrc,
+                user_id,
+                user_name,
+                pcm: silence,
+            };
+            if let Err(e) = self.audio_tx.send(chunk) {
+                warn!("Failed to send silence chunk: {}", e);
             }
         }
     }

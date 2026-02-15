@@ -848,11 +848,55 @@ impl DiscordBot {
                                         }
                                     });
 
+                                    // Build transcript_tx when transcript is enabled (post to VC-linked text channel)
+                                    let transcript_tx = if let Some(ref vc) = self.config.voice {
+                                        if vc.transcript.enabled {
+                                            vc.transcript.channel_id.as_ref().map(|channel_id| {
+                                                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                                                let http = self.http.clone();
+                                                let token = self.discord_config.token.clone();
+                                                let channel_id = channel_id.clone();
+                                                tokio::spawn(async move {
+                                                    while let Some(entry) = rx.recv().await {
+                                                        let formatted = crate::voice::transcript::format_entry(&entry);
+                                                        let url = format!("{}/channels/{}/messages", DISCORD_API_BASE, channel_id);
+                                                        let body = serde_json::json!({"content": formatted});
+                                                        match http.post(&url).header("Authorization", format!("Bot {}", token)).json(&body).send().await {
+                                                            Ok(resp) if !resp.status().is_success() => {
+                                                                warn!(status = %resp.status(), "Failed to post transcript to channel");
+                                                            }
+                                                            Err(e) => warn!("Transcript post failed: {}", e),
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                });
+                                                tx
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+
                                     // Initialize voice gateway (requires mutable access)
                                     {
                                         let mut vm = voice_manager.lock().await;
                                         vm.init_gateway(bot_user_id);
                                         info!("Voice gateway initialized for bot user {}", bot_user_id);
+
+                                        // Start the voice pipeline (with transcript_tx when transcript enabled, real LLM bridge)
+                                        let agent_bridge: Option<Arc<dyn crate::voice::agent_bridge::AgentBridge>> =
+                                            Some(Arc::new(
+                                                crate::voice::agent_bridge::RealAgentBridge::new(
+                                                    self.config.clone(),
+                                                ),
+                                            ));
+                                        if let Err(e) = vm.start_pipeline(transcript_tx, agent_bridge).await {
+                                            error!("Failed to start voice pipeline: {}", e);
+                                        } else {
+                                            info!("Voice pipeline started");
+                                        }
                                     }
 
                                     // Auto-join configured voice channels

@@ -164,6 +164,9 @@ pub struct VoiceSttWsConfig {
     #[serde(default = "default_voice_stt_ws_endpoint")]
     pub endpoint: String,
 
+    #[serde(default = "default_voice_stt_ws_sample_rate")]
+    pub sample_rate: u32,
+
     #[serde(default = "default_voice_stt_reconnect_interval")]
     pub reconnect_interval_ms: u64,
 
@@ -175,10 +178,15 @@ pub struct VoiceSttWsConfig {
     pub temperature: f64,
 }
 
+fn default_voice_stt_ws_sample_rate() -> u32 {
+    16000
+}
+
 impl Default for VoiceSttWsConfig {
     fn default() -> Self {
         Self {
             endpoint: default_voice_stt_ws_endpoint(),
+            sample_rate: default_voice_stt_ws_sample_rate(),
             reconnect_interval_ms: default_voice_stt_reconnect_interval(),
             max_reconnect_attempts: default_voice_stt_max_reconnect(),
             temperature: 0.0,
@@ -217,6 +225,15 @@ pub struct VoiceTtsAivisSpeechConfig {
 
     #[serde(default = "default_voice_tts_volume_scale")]
     pub volume_scale: f64,
+
+    /// Output format requested from the API: "wav" (PCM) or "opus".
+    /// Opus reduces payload size and is played directly by songbird without re-encode.
+    #[serde(default = "default_voice_tts_aivis_format")]
+    pub format: String,
+}
+
+fn default_voice_tts_aivis_format() -> String {
+    "wav".to_string()
 }
 
 impl Default for VoiceTtsAivisSpeechConfig {
@@ -226,6 +243,7 @@ impl Default for VoiceTtsAivisSpeechConfig {
             model: default_voice_tts_aivis_model(),
             speed_scale: default_voice_tts_speed_scale(),
             volume_scale: default_voice_tts_volume_scale(),
+            format: default_voice_tts_aivis_format(),
         }
     }
 }
@@ -743,7 +761,7 @@ fn default_voice_stt_provider() -> String {
     "ws".to_string()
 }
 fn default_voice_stt_ws_endpoint() -> String {
-    "ws://127.0.0.1:8766/ws".to_string()
+    "ws://100.89.44.63/ws".to_string()
 }
 fn default_voice_stt_reconnect_interval() -> u64 {
     1000
@@ -779,7 +797,7 @@ fn default_voice_stt_max_concurrent() -> usize {
     4
 }
 fn default_voice_context_window_ms() -> u64 {
-    2000
+    200
 }
 
 impl Default for AgentConfig {

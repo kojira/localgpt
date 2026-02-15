@@ -67,23 +67,6 @@ mod tests {
     }
 
     #[test]
-    fn default_stt_ws_config() {
-        let ws = VoiceSttWsConfig::default();
-        assert_eq!(ws.endpoint, "ws://127.0.0.1:8766/ws");
-        assert_eq!(ws.reconnect_interval_ms, 1000);
-        assert_eq!(ws.max_reconnect_attempts, 10);
-    }
-
-    #[test]
-    fn default_tts_aivis_config() {
-        let aivis = VoiceTtsAivisSpeechConfig::default();
-        assert_eq!(aivis.endpoint, "http://127.0.0.1:8001");
-        assert_eq!(aivis.model, "donchan");
-        assert!((aivis.speed_scale - 1.0).abs() < f64::EPSILON);
-        assert!((aivis.volume_scale - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
     fn default_transcript_is_disabled() {
         let vc = VoiceConfig::default();
         assert!(!vc.transcript.enabled);

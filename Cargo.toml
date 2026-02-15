@@ -21,7 +21,7 @@ desktop = ["eframe"]
 # GGUF embedding model support via llama.cpp (requires C++ compiler)
 gguf = ["llama-cpp-2"]
 # Discord voice chat (STT → LLM → TTS pipeline)
-voice = ["dep:songbird", "dep:rubato", "dep:hound", "dep:tokio-util", "dep:rustls", "dep:audiopus"]
+voice = ["dep:songbird", "dep:symphonia-core", "dep:symphonia-format-ogg", "dep:rubato", "dep:hound", "dep:tokio-util", "dep:rustls"]
 
 [dependencies]
 # Async runtime
@@ -113,12 +113,14 @@ eframe = { version = "0.33", optional = true, default-features = false, features
 ] }
 
 # Voice chat (optional — enable with --features voice)
-songbird = { git = "https://github.com/serenity-rs/songbird", branch = "current", default-features = false, features = ["driver", "gateway", "receive", "rustls", "tungstenite"], optional = true }
+songbird = { git = "https://github.com/serenity-rs/songbird", branch = "current", default-features = false, features = ["driver", "gateway", "receive", "rustls", "tungstenite", "builtin-queue"], optional = true }
+# Ogg container support for TTS Opus (songbird's get_probe() only has DCA; Ogg Opus needs this)
+symphonia-core = { version = "0.5", optional = true }
+symphonia-format-ogg = { version = "0.5", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
 rubato = { version = "0.16", optional = true }
 hound = { version = "3.5", optional = true }
 tokio-util = { version = "0.7", optional = true }
-audiopus = { version = "0.3.0-rc.0", optional = true }
 dashmap = "6.1"
 hex = "0.4"
 

@@ -75,6 +75,14 @@ mod tests {
         async fn reset_context(&self, _user_id: u64) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn generate_room(
+            &self,
+            _room_id: u64,
+            _messages: &[crate::voice::agent_bridge::RoomMessage],
+        ) -> anyhow::Result<String> {
+            tokio::time::sleep(self.delay).await;
+            Ok(self.response.clone())
+        }
     }
 
     /// A configurable agent bridge that returns different responses per call.
@@ -103,6 +111,18 @@ mod tests {
         async fn reset_context(&self, _user_id: u64) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn generate_room(
+            &self,
+            _room_id: u64,
+            _messages: &[crate::voice::agent_bridge::RoomMessage],
+        ) -> anyhow::Result<String> {
+            let mut responses = self.responses.lock().unwrap();
+            if responses.is_empty() {
+                Ok("default response".to_string())
+            } else {
+                Ok(responses.remove(0))
+            }
+        }
     }
 
     /// Build a full pipeline worker with mocks.
@@ -113,7 +133,7 @@ mod tests {
     ) -> (
         PipelineWorker,
         mpsc::UnboundedSender<Vec<f32>>,
-        mpsc::UnboundedReceiver<(u64, Vec<f32>)>,
+        mpsc::UnboundedReceiver<(u64, crate::voice::PlaybackAudio)>,
         Arc<AtomicBool>,
         CancellationToken,
     ) {
@@ -134,6 +154,8 @@ mod tests {
             is_playing.clone(),
             cancel.clone(),
             300,
+            0,
+            None,
         );
         (worker, in_tx, out_rx, is_playing, cancel)
     }
@@ -146,7 +168,7 @@ mod tests {
     ) -> (
         PipelineWorker,
         mpsc::UnboundedSender<Vec<f32>>,
-        mpsc::UnboundedReceiver<(u64, Vec<f32>)>,
+        mpsc::UnboundedReceiver<(u64, crate::voice::PlaybackAudio)>,
         mpsc::UnboundedReceiver<TranscriptEntry>,
         Arc<AtomicBool>,
         CancellationToken,
@@ -169,6 +191,8 @@ mod tests {
             is_playing.clone(),
             cancel.clone(),
             300,
+            0,
+            None,
         );
         (worker, in_tx, out_rx, transcript_rx, is_playing, cancel)
     }
@@ -252,7 +276,7 @@ mod tests {
             })),
             Arc::new(MockTtsProvider::silent()),
             Arc::new(MockAgentBridge::new()),
-            in_rx, out_tx, None, is_playing, cancel, 1,
+            in_rx, out_tx, None, is_playing, cancel, 1, 0, None,
         );
         let _ = in_tx; // keep channel open
 
@@ -292,9 +316,10 @@ mod tests {
         assert_eq!(uid, 1);
         assert!(!audio.is_empty());
 
-        // Verify it's actually a sine wave (has positive and negative values).
-        let has_positive = audio.iter().any(|&s| s > 0.1);
-        let has_negative = audio.iter().any(|&s| s < -0.1);
+        // Verify it's actually a sine wave (mock TTS returns Pcm).
+        let pcm = audio.pcm_samples().expect("mock returns PCM");
+        let has_positive = pcm.iter().any(|&s| s > 0.1);
+        let has_negative = pcm.iter().any(|&s| s < -0.1);
         assert!(has_positive && has_negative, "Expected sine wave audio");
 
         drop(in_tx);
@@ -381,7 +406,7 @@ mod tests {
         let (uid, audio) = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
             .await.unwrap().unwrap();
         assert_eq!(uid, 1);
-        assert!(audio.len() > 1000, "Expected substantial audio output, got {} samples", audio.len());
+        assert!(audio.len() > 1000, "Expected substantial audio output, got {} len", audio.len());
 
         drop(in_tx);
         handle.await.unwrap().unwrap();
@@ -415,7 +440,7 @@ mod tests {
         // MockTtsProvider: 150ms per char. Long text = many chars = many samples.
         // "echo: 短い" (short) would be ~10 chars * 150ms = 1500ms = 36000 samples
         // Long text is much longer.
-        assert!(audio.len() > 100_000, "Long response should produce lots of audio, got {} samples", audio.len());
+        assert!(audio.len() > 100_000, "Long response should produce lots of audio, got {} len", audio.len());
 
         drop(in_tx);
         handle.await.unwrap().unwrap();
@@ -511,7 +536,7 @@ mod tests {
 
         let mut dispatcher = Dispatcher::new(
             stt, tts, bridge, out_tx, None,
-            "Bot".to_string(), 300, true,
+            "Bot".to_string(), 300, true, Some(0), None,
         );
 
         // Spawn worker.
@@ -539,7 +564,7 @@ mod tests {
 
         let mut dispatcher = Dispatcher::new(
             stt, tts, bridge, out_tx, None,
-            "Bot".to_string(), 300, true,
+            "Bot".to_string(), 300, true, Some(0), None,
         );
 
         // Two users speak at the same time.
@@ -574,7 +599,7 @@ mod tests {
 
         let mut dispatcher = Dispatcher::new(
             stt, tts, bridge, out_tx, Some(transcript_tx),
-            "Bot".to_string(), 300, true,
+            "Bot".to_string(), 300, true, Some(0), None,
         );
 
         dispatcher.dispatch(1, "Alice".to_string(), trigger_audio());
@@ -650,7 +675,7 @@ mod tests {
             Ok(None) => {} // Worker exited, channel closed — no audio, correct.
             Ok(Some((_, audio))) => {
                 panic!(
-                    "Empty STT text should not trigger TTS, got {} samples",
+                    "Empty STT text should not trigger TTS, got {} len",
                     audio.len()
                 );
             }

@@ -7,6 +7,17 @@
 //!
 //! Supports barge-in (interrupt) via `CancellationToken` and
 //! idle timeout via configurable silence duration.
+//!
+//! PCM is buffered to 100ms (1600 samples at 16 kHz) before sending to STT,
+//! so that backends with frame-based VAD receive more stable input.
+
+/// STT input sample rate (must match receiver resample output).
+const STT_SAMPLE_RATE: u32 = 16000;
+/// Buffer size in ms before sending to STT; many backends work better with ~100ms frames.
+const STT_BUFFER_MS: u32 = 100;
+/// Samples per buffer at STT_SAMPLE_RATE. Use 0 in tests for no buffering.
+pub const STT_BUFFER_SAMPLES: usize =
+    (STT_SAMPLE_RATE as usize * STT_BUFFER_MS as usize) / 1000;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -18,7 +29,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
-use super::agent_bridge::AgentBridge;
+use super::agent_bridge::{AgentBridge, RoomMessage};
 use super::provider::{SttEvent, SttProvider, TtsProvider};
 use super::transcript::TranscriptEntry;
 
@@ -31,7 +42,7 @@ pub struct PipelineWorker {
     tts_provider: Arc<dyn TtsProvider>,
     agent_bridge: Arc<dyn AgentBridge>,
     audio_rx: mpsc::UnboundedReceiver<Vec<f32>>,
-    audio_output_tx: mpsc::UnboundedSender<(u64, Vec<f32>)>,
+    audio_output_tx: mpsc::UnboundedSender<(u64, crate::voice::PlaybackAudio)>,
     transcript_tx: Option<mpsc::UnboundedSender<TranscriptEntry>>,
     /// Shared flag indicating whether the bot is currently playing audio.
     is_playing: Arc<AtomicBool>,
@@ -39,6 +50,12 @@ pub struct PipelineWorker {
     cancel: CancellationToken,
     /// Idle timeout duration (0 = disabled).
     idle_timeout: Duration,
+    /// Min samples to buffer before sending to STT (0 = send every chunk).
+    stt_buffer_samples: usize,
+    /// Accumulates PCM until stt_buffer_samples, then sends to STT.
+    pcm_buffer: Vec<f32>,
+    /// When Some, STT finals are sent here for room batching instead of per-user LLM+TTS.
+    room_tx: Option<mpsc::UnboundedSender<RoomMessage>>,
 }
 
 impl PipelineWorker {
@@ -51,11 +68,13 @@ impl PipelineWorker {
         tts_provider: Arc<dyn TtsProvider>,
         agent_bridge: Arc<dyn AgentBridge>,
         audio_rx: mpsc::UnboundedReceiver<Vec<f32>>,
-        audio_output_tx: mpsc::UnboundedSender<(u64, Vec<f32>)>,
+        audio_output_tx: mpsc::UnboundedSender<(u64, crate::voice::PlaybackAudio)>,
         transcript_tx: Option<mpsc::UnboundedSender<TranscriptEntry>>,
         is_playing: Arc<AtomicBool>,
         cancel: CancellationToken,
         idle_timeout_sec: u64,
+        stt_buffer_samples: usize,
+        room_tx: Option<mpsc::UnboundedSender<RoomMessage>>,
     ) -> Self {
         Self {
             user_id,
@@ -75,12 +94,19 @@ impl PipelineWorker {
             } else {
                 Duration::from_secs(idle_timeout_sec)
             },
+            stt_buffer_samples,
+            pcm_buffer: Vec::with_capacity(if stt_buffer_samples == 0 {
+                0
+            } else {
+                stt_buffer_samples * 2
+            }),
+            room_tx,
         }
     }
 
     /// Run the worker loop.
     ///
-    /// Receives PCM chunks, forwards to STT, drains recognition events,
+    /// Receives PCM chunks, forwards to STT, handles recognition events,
     /// calls the agent bridge for final transcriptions, synthesizes TTS,
     /// and emits transcript entries.
     ///
@@ -91,7 +117,7 @@ impl PipelineWorker {
     pub async fn run(&mut self) -> Result<WorkerExitReason> {
         info!(user_id = self.user_id, "PipelineWorker started");
 
-        let mut stt_session = self.stt_provider.connect().await?;
+        let (mut stt_sender, mut stt_receiver) = self.stt_provider.connect().await?;
         let mut last_speech_at = Instant::now();
 
         loop {
@@ -103,7 +129,12 @@ impl PipelineWorker {
                 // External cancellation (shutdown).
                 _ = self.cancel.cancelled() => {
                     info!(user_id = self.user_id, "PipelineWorker cancelled");
-                    stt_session.close().await?;
+                    if !self.pcm_buffer.is_empty() {
+                        let chunk = std::mem::take(&mut self.pcm_buffer);
+                        let _ = stt_sender.send_audio(&chunk).await;
+                    }
+                    let _ = stt_sender.send_end_of_stream().await;
+                    stt_sender.close().await?;
                     return Ok(WorkerExitReason::Cancelled);
                 }
 
@@ -114,66 +145,108 @@ impl PipelineWorker {
                         timeout_secs = self.idle_timeout.as_secs(),
                         "Idle timeout reached, stopping worker"
                     );
-                    stt_session.close().await?;
+                    if !self.pcm_buffer.is_empty() {
+                        let chunk = std::mem::take(&mut self.pcm_buffer);
+                        let _ = stt_sender.send_audio(&chunk).await;
+                    }
+                    let _ = stt_sender.send_end_of_stream().await;
+                    stt_sender.close().await?;
                     return Ok(WorkerExitReason::IdleTimeout);
                 }
 
                 // Audio input.
                 pcm = self.audio_rx.recv() => {
                     let Some(pcm) = pcm else {
-                        // Channel closed — dispatcher removed us.
+                        // Channel closed — flush remaining buffered PCM to STT.
+                        if !self.pcm_buffer.is_empty() {
+                            let chunk = std::mem::take(&mut self.pcm_buffer);
+                            stt_sender.send_audio(&chunk).await?;
+                        }
                         break;
                     };
 
-                    stt_session.send_audio(&pcm).await?;
+                    if self.stt_buffer_samples == 0 {
+                        stt_sender.send_audio(&pcm).await?;
+                    } else {
+                        self.pcm_buffer.extend_from_slice(&pcm);
+                        while self.pcm_buffer.len() >= self.stt_buffer_samples {
+                            let n = self.stt_buffer_samples;
+                            let chunk: Vec<f32> =
+                                self.pcm_buffer.drain(..n).collect();
+                            stt_sender.send_audio(&chunk).await?;
+                        }
+                    }
+                }
 
-                    // Drain all available events after sending audio.
-                    loop {
-                        match stt_session.recv_event().await? {
-                            Some(SttEvent::SpeechStart { .. }) => {
-                                last_speech_at = Instant::now();
-                                debug!(user_id = self.user_id, "Speech start (timer reset)");
+                // STT event reception.
+                event_result = stt_receiver.recv_event() => {
+                    match event_result? {
+                        Some(SttEvent::SpeechStart { .. }) => {
+                            last_speech_at = Instant::now();
+                            debug!(user_id = self.user_id, "Speech start (timer reset)");
 
-                                // Barge-in: if bot is playing, signal interrupt.
-                                if self.is_playing.load(Ordering::Acquire) {
-                                    info!(
-                                        user_id = self.user_id,
-                                        "Barge-in detected, cancelling playback"
-                                    );
-                                    // The dispatcher watches is_playing and will
-                                    // handle the actual cancellation/token rotation.
-                                    // We notify via a special audio output message.
-                                    let _ = self.audio_output_tx.send((self.user_id, vec![]));
+                            // Barge-in: if bot is playing, signal interrupt.
+                            if self.is_playing.load(Ordering::Acquire) {
+                                info!(
+                                    user_id = self.user_id,
+                                    "Barge-in detected, cancelling playback"
+                                );
+                                // The dispatcher watches is_playing and will
+                                // handle the actual cancellation/token rotation.
+                                // We notify via a special audio output message.
+                                let _ = self.audio_output_tx.send((
+                                    self.user_id,
+                                    crate::voice::PlaybackAudio::Pcm(vec![]),
+                                ));
+                            }
+                        }
+                        Some(SttEvent::Final { ref text, .. }) => {
+                            last_speech_at = Instant::now();
+                            if text.trim().is_empty() {
+                                continue;
+                            }
+                            info!(user_id = self.user_id, text, "STT final");
+
+                            // Log user speech transcript.
+                            self.send_transcript(TranscriptEntry::UserSpeech {
+                                user_id: self.user_id,
+                                user_name: self.user_name.clone(),
+                                text: text.clone(),
+                            });
+
+                            // Room mode: send to collector for batched LLM; otherwise per-user LLM+TTS.
+                            if let Some(ref room_tx) = self.room_tx {
+                                if room_tx.send((
+                                    self.user_id,
+                                    self.user_name.clone(),
+                                    text.clone(),
+                                )).is_err() {
+                                    debug!(user_id = self.user_id, "Room collector channel closed");
                                 }
+                                continue;
                             }
-                            Some(SttEvent::Final { ref text, .. }) => {
-                                last_speech_at = Instant::now();
-                                if text.trim().is_empty() {
-                                    continue;
-                                }
-                                debug!(user_id = self.user_id, text, "STT final");
 
-                                // Log user speech transcript.
-                                self.send_transcript(TranscriptEntry::UserSpeech {
-                                    user_id: self.user_id,
-                                    user_name: self.user_name.clone(),
-                                    text: text.clone(),
-                                });
-
-                                // Process text through agent + TTS with cancellation support.
-                                self.process_text(text).await?;
-                            }
-                            Some(event) => {
-                                debug!(user_id = self.user_id, ?event, "STT event");
-                            }
-                            None => break,
+                            // Process text through agent + TTS with cancellation support.
+                            self.process_text(text).await?;
+                        }
+                        Some(event) => {
+                            debug!(user_id = self.user_id, ?event, "STT event");
+                        }
+                        None => {
+                            // STT session closed normally.
+                            break;
                         }
                     }
                 }
             }
         }
 
-        stt_session.close().await?;
+        if !self.pcm_buffer.is_empty() {
+            let chunk = std::mem::take(&mut self.pcm_buffer);
+            let _ = stt_sender.send_audio(&chunk).await;
+        }
+        let _ = stt_sender.send_end_of_stream().await;
+        stt_sender.close().await?;
         info!(user_id = self.user_id, "PipelineWorker stopped");
         Ok(WorkerExitReason::ChannelClosed)
     }
@@ -242,12 +315,29 @@ impl PipelineWorker {
             text: response.clone(),
         });
 
-        // Send audio for playback.
-        if self
-            .audio_output_tx
-            .send((self.user_id, tts_result.audio))
-            .is_err()
-        {
+        let preview = response.chars().take(40).collect::<String>();
+        let playback = match &tts_result {
+            crate::voice::provider::TtsResult::Pcm { audio, .. } => {
+                info!(
+                    user_id = self.user_id,
+                    samples = audio.len(),
+                    response_preview = %preview,
+                    "TTS synthesized, sending to playback"
+                );
+                crate::voice::PlaybackAudio::Pcm(audio.clone())
+            }
+            crate::voice::provider::TtsResult::EncodedOpus { data, .. } => {
+                info!(
+                    user_id = self.user_id,
+                    bytes = data.len(),
+                    response_preview = %preview,
+                    "TTS Opus synthesized, sending to playback"
+                );
+                crate::voice::PlaybackAudio::Opus(data.clone())
+            }
+        };
+
+        if self.audio_output_tx.send((self.user_id, playback)).is_err() {
             error!(user_id = self.user_id, "Audio output channel closed");
         }
 
@@ -311,7 +401,7 @@ mod tests {
         tts: Arc<dyn TtsProvider>,
         bridge: Arc<dyn AgentBridge>,
         audio_rx: mpsc::UnboundedReceiver<Vec<f32>>,
-        audio_output_tx: mpsc::UnboundedSender<(u64, Vec<f32>)>,
+        audio_output_tx: mpsc::UnboundedSender<(u64, crate::voice::PlaybackAudio)>,
         transcript_tx: Option<mpsc::UnboundedSender<TranscriptEntry>>,
         idle_timeout_sec: u64,
     ) -> (PipelineWorker, Arc<AtomicBool>, CancellationToken) {
@@ -330,6 +420,8 @@ mod tests {
             is_playing.clone(),
             cancel.clone(),
             idle_timeout_sec,
+            0,
+            None,
         );
         (worker, is_playing, cancel)
     }
@@ -360,6 +452,8 @@ mod tests {
             is_playing,
             cancel,
             DEFAULT_IDLE_TIMEOUT_SEC,
+            0,
+            None,
         );
         assert_eq!(w.user_id, 42);
     }
