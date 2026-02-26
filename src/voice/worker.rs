@@ -18,7 +18,14 @@ const STT_BUFFER_MS: u32 = 100;
 /// Samples per buffer at STT_SAMPLE_RATE. Use 0 in tests for no buffering.
 pub const STT_BUFFER_SAMPLES: usize =
     (STT_SAMPLE_RATE as usize * STT_BUFFER_MS as usize) / 1000;
+/// RMS amplitude threshold above which a PCM chunk is considered "audible" (voice-present).
+///
+/// Used to anchor `speech_start_at` to the first loud chunk rather than the STT
+/// `SpeechStart` event, which may arrive late or be missing entirely.
+/// Typical background noise RMS is < 0.005; voiced speech is usually > 0.01.
+const AUDIBLE_RMS_THRESHOLD: f32 = 0.01;
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,10 +35,13 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
+use super::profiling::{ProfileSession, VoiceProfilerWriter};
 
 use super::agent_bridge::{AgentBridge, RoomMessage};
 use super::provider::{SttEvent, SttProvider, TtsProvider};
+use super::splitter::SentenceSplitter;
 use super::transcript::TranscriptEntry;
+use super::tts_pipeline::TtsPipeline;
 
 /// Per-user voice processing pipeline.
 pub struct PipelineWorker {
@@ -56,6 +66,23 @@ pub struct PipelineWorker {
     pcm_buffer: Vec<f32>,
     /// When Some, STT finals are sent here for room batching instead of per-user LLM+TTS.
     room_tx: Option<mpsc::UnboundedSender<RoomMessage>>,
+    profiler_writer: VoiceProfilerWriter,
+    /// Timestamp of the first audible PCM chunk (RMS > AUDIBLE_RMS_THRESHOLD) in the current
+    /// utterance.  Used as the `speech_start_at` anchor for `ProfileSession` so that
+    /// `elapsed_from_speech_start` reflects actual voice onset rather than the (potentially
+    /// late or missing) STT `SpeechStart` event.  Reset to `None` each time a new
+    /// `ProfileSession` is created.
+    first_audible_at: Option<std::time::Instant>,
+    /// Timestamp of the first non-empty PCM chunk received since the last STT Final.
+    ///
+    /// Used as the **ultimate fallback** for `speech_start_at` when:
+    ///   - No `SpeechStart` event was received (→ `current_prof_session` is `None`), AND
+    ///   - No audible (RMS > threshold) chunk was detected (→ `first_audible_at` is `None`).
+    ///
+    /// Some STT servers skip `SpeechStart` for very short or quiet utterances and jump
+    /// straight to `Final`.  Without this anchor, the fallback `Instant::now()` is set
+    /// just before `log_stt_final()`, making `elapsed_from_speech_start = 0ms`.
+    pcm_session_start_at: Option<std::time::Instant>,
 }
 
 impl PipelineWorker {
@@ -101,6 +128,14 @@ impl PipelineWorker {
                 stt_buffer_samples * 2
             }),
             room_tx,
+            // In tests use a null (no-op) writer so unit test runs never create or
+            // pollute real profiling log files under ~/.localgpt/logs/.
+            #[cfg(not(test))]
+            profiler_writer: VoiceProfilerWriter::open(),
+            #[cfg(test)]
+            profiler_writer: VoiceProfilerWriter::null(),
+            first_audible_at: None,
+            pcm_session_start_at: None,
         }
     }
 
@@ -119,6 +154,12 @@ impl PipelineWorker {
 
         let (mut stt_sender, mut stt_receiver) = self.stt_provider.connect().await?;
         let mut last_speech_at = Instant::now();
+        // Profiling session: created on SpeechStart, consumed on process_text.
+        let mut current_prof_session: Option<ProfileSession> = None;
+        // Speech-start anchor for the current utterance, mirroring the one used for
+        // current_prof_session.  Carried into RoomMessage so room_collector can build
+        // an accurate ProfileSession without relying on the (late) batch arrival time.
+        let mut current_speech_start: Option<std::time::Instant> = None;
 
         loop {
             let idle_deadline = last_speech_at + self.idle_timeout;
@@ -165,6 +206,29 @@ impl PipelineWorker {
                         break;
                     };
 
+                    // Ultimate fallback anchor: capture when the first non-empty PCM
+                    // chunk of this utterance arrived.  Used when neither SpeechStart
+                    // nor an audible (RMS > threshold) chunk is available at Final time.
+                    if self.pcm_session_start_at.is_none() && !pcm.is_empty() {
+                        self.pcm_session_start_at = Some(std::time::Instant::now());
+                    }
+
+                    // Track the first audible chunk for speech-start anchoring.
+                    // This captures voice onset more accurately than the STT
+                    // `SpeechStart` event, which can arrive late or be missing.
+                    if self.first_audible_at.is_none() && !pcm.is_empty() {
+                        let sum_sq: f32 = pcm.iter().map(|s| s * s).sum();
+                        let rms = (sum_sq / pcm.len() as f32).sqrt();
+                        if rms > AUDIBLE_RMS_THRESHOLD {
+                            self.first_audible_at = Some(std::time::Instant::now());
+                            debug!(
+                                user_id = self.user_id,
+                                rms,
+                                "first audible chunk detected (speech-start anchor)"
+                            );
+                        }
+                    }
+
                     if self.stt_buffer_samples == 0 {
                         stt_sender.send_audio(&pcm).await?;
                     } else {
@@ -184,6 +248,26 @@ impl PipelineWorker {
                         Some(SttEvent::SpeechStart { .. }) => {
                             last_speech_at = Instant::now();
                             debug!(user_id = self.user_id, "Speech start (timer reset)");
+                            // Anchor to the first audible PCM chunk if available.
+                            // Priority: first_audible_at (RMS>threshold, best) >
+                            //           pcm_session_start_at (any PCM, fallback) >
+                            //           Instant::now() (last resort).
+                            let speech_start = self
+                                .first_audible_at
+                                .take()
+                                .or_else(|| self.pcm_session_start_at.take())
+                                .unwrap_or_else(std::time::Instant::now);
+                            self.pcm_session_start_at = None;
+                            info!(
+                                user_id = self.user_id,
+                                speech_start_age_ms = speech_start.elapsed().as_millis() as u64,
+                                "STT SpeechStart: profiling anchor set"
+                            );
+                            current_speech_start = Some(speech_start);
+                            current_prof_session = Some(ProfileSession::new_with_start(
+                                self.profiler_writer.clone(),
+                                speech_start,
+                            ));
 
                             // Barge-in: if bot is playing, signal interrupt.
                             if self.is_playing.load(Ordering::Acquire) {
@@ -206,6 +290,14 @@ impl PipelineWorker {
                                 continue;
                             }
                             info!(user_id = self.user_id, text, "STT final");
+                            let has_room_tx = self.room_tx.is_some();
+                            let _ = std::fs::OpenOptions::new().append(true).create(true)
+                                .open("/Users/kojira/.openclaw/workspace/projects/localgpt/.cursor/debug.log")
+                                .and_then(|mut f| {
+                                    use std::io::Write;
+                                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+                                    writeln!(f, r#"{{"id":"stt_final","timestamp":{},"location":"voice/worker.rs","message":"STT Final","data":{{"user_id":{},"has_room_tx":{},"text_len":{}}},"hypothesisId":"B,C"}}"#, ts, self.user_id, has_room_tx, text.len())
+                                });
 
                             // Log user speech transcript.
                             self.send_transcript(TranscriptEntry::UserSpeech {
@@ -216,18 +308,66 @@ impl PipelineWorker {
 
                             // Room mode: send to collector for batched LLM; otherwise per-user LLM+TTS.
                             if let Some(ref room_tx) = self.room_tx {
-                                if room_tx.send((
+                                // Log STT_FINAL for room mode (room_collector handles LLM/TTS timing).
+                                if let Some(ref mut s) = current_prof_session {
+                                    s.log_stt_final(text);
+                                }
+                                // Reset all PCM-timing anchors so the next utterance starts fresh.
+                                // (session is not consumed in room mode — only borrowed above.)
+                                self.first_audible_at = None;
+                                self.pcm_session_start_at = None;
+                                // Take the speech_start anchor and carry it in the RoomMessage so
+                                // room_collector's ProfileSession uses the true voice-onset time.
+                                // Fallback chain mirrors SpeechStart handler above.
+                                let speech_start = current_speech_start
+                                    .take()
+                                    .unwrap_or_else(std::time::Instant::now);
+                                let send_ok = room_tx.send((
                                     self.user_id,
                                     self.user_name.clone(),
                                     text.clone(),
-                                )).is_err() {
+                                    speech_start,
+                                )).is_ok();
+                                let _ = std::fs::OpenOptions::new().append(true).create(true)
+                                    .open("/Users/kojira/.openclaw/workspace/projects/localgpt/.cursor/debug.log")
+                                    .and_then(|mut f| {
+                                        use std::io::Write;
+                                        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+                                        writeln!(f, r#"{{"id":"room_send","timestamp":{},"location":"voice/worker.rs","message":"room_tx.send","data":{{"user_id":{},"send_ok":{}}},"hypothesisId":"C"}}"#, ts, self.user_id, send_ok)
+                                    });
+                                if !send_ok {
                                     debug!(user_id = self.user_id, "Room collector channel closed");
                                 }
                                 continue;
                             }
 
+                            // Take profiling session (or create one if SpeechStart was missed).
+                            // Anchor priority (best → worst):
+                            //   1. current_prof_session  — already anchored at SpeechStart
+                            //   2. first_audible_at      — first RMS-loud PCM chunk
+                            //   3. pcm_session_start_at  — first any PCM chunk (quiet speech)
+                            //   4. Instant::now()        — last resort; gives near-0ms elapsed
+                            let mut prof_session = current_prof_session.take().unwrap_or_else(|| {
+                                let start = self
+                                    .first_audible_at
+                                    .take()
+                                    .or_else(|| self.pcm_session_start_at.take())
+                                    .unwrap_or_else(std::time::Instant::now);
+                                ProfileSession::new_with_start(self.profiler_writer.clone(), start)
+                            });
+                            // Reset all per-utterance anchors for the next turn.
+                            self.first_audible_at = None;
+                            self.pcm_session_start_at = None;
+                            current_speech_start = None;
+                            prof_session.log_stt_final(text);
+
                             // Process text through agent + TTS with cancellation support.
-                            self.process_text(text).await?;
+                            self.process_text(text, prof_session).await?;
+                        }
+                        Some(SttEvent::Partial { ref text }) => {
+                            if let Some(ref mut s) = current_prof_session {
+                                s.log_stt_partial(text);
+                            }
                         }
                         Some(event) => {
                             debug!(user_id = self.user_id, ?event, "STT event");
@@ -251,98 +391,194 @@ impl PipelineWorker {
         Ok(WorkerExitReason::ChannelClosed)
     }
 
-    /// Generate agent response and synthesize TTS, with cancellation support.
+    /// Generate agent response via streaming LLM, split into sentences,
+    /// synthesize TTS in parallel per segment, and play in sequence order.
     ///
-    /// If the cancellation token fires during LLM generation or TTS synthesis,
-    /// we record the partial transcript and return early.
-    async fn process_text(&self, text: &str) -> Result<()> {
-        // Create a child token so that barge-in during this specific
-        // response can be detected without killing the whole worker.
+    /// Flow:
+    ///   `generate_stream()` → `SentenceSplitter` → `TtsPipeline` (parallel TTS)
+    ///   → `BTreeMap` ordered buffer → `audio_output_tx` (in-order playback)
+    ///
+    /// This allows audio playback to begin as soon as the first sentence is
+    /// synthesised, instead of waiting for the full LLM response.
+    ///
+    /// If the cancellation token fires at any point, partial playback is
+    /// recorded in the transcript and the function returns early.
+    async fn process_text(&self, text: &str, mut prof_session: ProfileSession) -> Result<()> {
+        // Child token: barge-in can cancel this response without killing the worker.
         let response_cancel = self.cancel.child_token();
 
-        // Generate agent response — cancellable.
-        let response = tokio::select! {
+        // ── Phase 1: Start LLM streaming ─────────────────────────────────────
+        prof_session.log_llm_start();
+        let token_stream = tokio::select! {
             biased;
             _ = response_cancel.cancelled() => {
-                debug!(user_id = self.user_id, "LLM generation cancelled by interrupt");
+                debug!(user_id = self.user_id, "LLM stream cancelled before start");
                 return Ok(());
             }
-            result = self.agent_bridge.generate(self.user_id, text) => {
-                result?
-            }
+            result = self.agent_bridge.generate_stream(self.user_id, text) => result?
         };
 
-        // Check cancellation before starting TTS.
-        if response_cancel.is_cancelled() {
-            debug!(user_id = self.user_id, "Cancelled before TTS");
-            return Ok(());
-        }
+        // ── Phase 2: Sentence splitting ──────────────────────────────────────
+        // SentenceSplitter accumulates tokens and emits one segment per sentence.
+        let sentence_stream = SentenceSplitter::default().split(token_stream);
 
-        // Mark as playing before TTS synthesis + playback.
+        // ── Phase 3: Parallel TTS pipeline ───────────────────────────────────
+        // TtsPipeline dispatches TTS for each segment concurrently (up to 3 at once).
+        // Segments may complete out of order; we reorder below.
+        let pipeline = TtsPipeline::with_defaults(Arc::clone(&self.tts_provider));
+        let mut tts_rx = pipeline.process(sentence_stream);
+
+        // Signal that the bot has started producing audio.
         self.is_playing.store(true, Ordering::Release);
 
-        // Synthesize TTS — cancellable.
-        let tts_result = tokio::select! {
-            biased;
-            _ = response_cancel.cancelled() => {
-                self.is_playing.store(false, Ordering::Release);
-                debug!(user_id = self.user_id, "TTS synthesis cancelled by interrupt");
-                // Record interrupted transcript (nothing played yet).
-                self.send_transcript(TranscriptEntry::BotResponseInterrupted {
-                    bot_name: self.bot_name.clone(),
-                    played_text: String::new(),
-                });
-                return Ok(());
-            }
-            result = self.tts_provider.synthesize(&response) => {
-                result?
-            }
-        };
+        // ── Phase 4: Ordered playback loop ───────────────────────────────────
+        // Buffer completed TTS segments by sequence index, then drain in order.
+        let mut pending: BTreeMap<usize, super::tts_pipeline::TtsSegment> = BTreeMap::new();
+        let mut next_play_idx: usize = 0;
+        // Text accumulated in playback order (for transcript).
+        let mut played_text = String::new();
+        let mut first_segment_logged = false;
+        let mut audio_play_logged = false;
 
-        // Check cancellation before sending audio.
-        if response_cancel.is_cancelled() {
-            self.is_playing.store(false, Ordering::Release);
-            self.send_transcript(TranscriptEntry::BotResponseInterrupted {
-                bot_name: self.bot_name.clone(),
-                played_text: String::new(),
-            });
-            return Ok(());
+        loop {
+            tokio::select! {
+                biased;
+
+                // Barge-in / cancellation during playback.
+                _ = response_cancel.cancelled() => {
+                    self.is_playing.store(false, Ordering::Release);
+                    info!(
+                        user_id = self.user_id,
+                        played_segments = next_play_idx,
+                        "Streaming TTS cancelled mid-playback"
+                    );
+                    self.send_transcript(TranscriptEntry::BotResponseInterrupted {
+                        bot_name: self.bot_name.clone(),
+                        played_text: played_text.clone(),
+                    });
+                    return Ok(());
+                }
+
+                // Next completed TTS segment from the pipeline.
+                item = tts_rx.recv() => {
+                    let Some(result) = item else {
+                        // All segments received — exit loop and flush any remainder.
+                        break;
+                    };
+                    match result {
+                        Ok(tts_seg) => {
+                            // Log first-segment latency (key streaming metric).
+                            if !first_segment_logged {
+                                prof_session.log_llm_first_segment();
+                                first_segment_logged = true;
+                            }
+
+                            // Log LLM segment text + TTS duration at INFO.
+                            // Full text without truncation so SentenceSplitter boundaries are visible.
+                            info!(
+                                user_id = self.user_id,
+                                segment = tts_seg.index,
+                                text = %tts_seg.text,
+                                tts_duration_ms = tts_seg.tts_duration_ms,
+                                "TTS input[{}]: \"{}\"",
+                                tts_seg.index,
+                                tts_seg.text
+                            );
+                            prof_session.log_llm_segment(tts_seg.index, &tts_seg.text, tts_seg.synthesis_started_at);
+                            prof_session.log_tts_segment_done(tts_seg.index, tts_seg.tts_duration_ms, tts_seg.synthesis_started_at);
+
+                            pending.insert(tts_seg.index, tts_seg);
+
+                            // Drain pending in strict sequence order.
+                            while let Some(seg) = pending.remove(&next_play_idx) {
+                                let playback = Self::tts_result_to_playback(
+                                    &seg.tts_result,
+                                    self.user_id,
+                                    next_play_idx,
+                                    &seg.text,
+                                );
+
+                                // Log AUDIO_PLAY once (first segment sent to queue).
+                                if !audio_play_logged {
+                                    prof_session.log_audio_play();
+                                    audio_play_logged = true;
+                                }
+
+                                played_text.push_str(&seg.text);
+                                if self.audio_output_tx.send((self.user_id, playback)).is_err() {
+                                    error!(user_id = self.user_id, "Audio output channel closed");
+                                }
+                                next_play_idx += 1;
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                user_id = self.user_id,
+                                error = %e,
+                                "TTS pipeline segment error (skipping)"
+                            );
+                        }
+                    }
+                }
+            }
         }
 
-        // Log bot response transcript.
+        // Flush any segments that arrived but were waiting on a gap
+        // (e.g. segment 0 errored so 1, 2 were buffered behind it).
+        // BTreeMap iterates in key order, so playback order is preserved.
+        for (_idx, seg) in pending {
+            let playback = Self::tts_result_to_playback(
+                &seg.tts_result,
+                self.user_id,
+                _idx,
+                &seg.text,
+            );
+            played_text.push_str(&seg.text);
+            if self.audio_output_tx.send((self.user_id, playback)).is_err() {
+                error!(user_id = self.user_id, "Audio output channel closed during flush");
+            }
+        }
+
+        // Log full response transcript.
         self.send_transcript(TranscriptEntry::BotResponse {
             bot_name: self.bot_name.clone(),
-            text: response.clone(),
+            text: played_text,
         });
 
-        let preview = response.chars().take(40).collect::<String>();
-        let playback = match &tts_result {
+        self.is_playing.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Convert a [`TtsResult`] to a [`PlaybackAudio`], logging details.
+    fn tts_result_to_playback(
+        tts_result: &crate::voice::provider::TtsResult,
+        user_id: u64,
+        segment_idx: usize,
+        text: &str,
+    ) -> crate::voice::PlaybackAudio {
+        let preview = text.chars().take(40).collect::<String>();
+        match tts_result {
             crate::voice::provider::TtsResult::Pcm { audio, .. } => {
                 info!(
-                    user_id = self.user_id,
+                    user_id,
+                    segment = segment_idx,
                     samples = audio.len(),
-                    response_preview = %preview,
-                    "TTS synthesized, sending to playback"
+                    preview = %preview,
+                    "TTS segment ready, sending to playback"
                 );
                 crate::voice::PlaybackAudio::Pcm(audio.clone())
             }
             crate::voice::provider::TtsResult::EncodedOpus { data, .. } => {
                 info!(
-                    user_id = self.user_id,
+                    user_id,
+                    segment = segment_idx,
                     bytes = data.len(),
-                    response_preview = %preview,
-                    "TTS Opus synthesized, sending to playback"
+                    preview = %preview,
+                    "TTS Opus segment ready, sending to playback"
                 );
                 crate::voice::PlaybackAudio::Opus(data.clone())
             }
-        };
-
-        if self.audio_output_tx.send((self.user_id, playback)).is_err() {
-            error!(user_id = self.user_id, "Audio output channel closed");
         }
-
-        self.is_playing.store(false, Ordering::Release);
-        Ok(())
     }
 
     /// Send a transcript entry if the transcript channel is configured.

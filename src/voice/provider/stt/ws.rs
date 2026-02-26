@@ -53,7 +53,7 @@ struct WsServerMessage {
     #[serde(default)]
     confidence: Option<f32>,
     #[serde(default)]
-    timestamp_ms: Option<u64>,
+    timestamp_ms: Option<f64>,
     #[serde(default)]
     duration_ms: Option<f64>,
     /// Some servers send a single `transcript` event with `is_final` flag
@@ -72,7 +72,7 @@ impl WsServerMessage {
     fn into_stt_event(self) -> Option<SttEvent> {
         match self.msg_type.as_str() {
             "speech_start" => Some(SttEvent::SpeechStart {
-                timestamp_ms: self.timestamp_ms.unwrap_or(0),
+                timestamp_ms: self.timestamp_ms.unwrap_or(0.0) as u64,
             }),
             "partial" => Some(SttEvent::Partial {
                 text: self.text.unwrap_or_default(),
@@ -84,7 +84,7 @@ impl WsServerMessage {
                 duration_ms: self.duration_ms.unwrap_or(0.0),
             }),
             "speech_end" => Some(SttEvent::SpeechEnd {
-                timestamp_ms: self.timestamp_ms.unwrap_or(0),
+                timestamp_ms: self.timestamp_ms.unwrap_or(0.0) as u64,
                 duration_ms: self.duration_ms.unwrap_or(0.0),
             }),
             // Handle `transcript` events with `is_final` flag.
@@ -139,11 +139,16 @@ impl WsSttProvider {
     async fn connect_with_retry(
         &self,
     ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        let endpoint = self
+            .config
+            .endpoint
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("voice.stt.ws.endpoint must be set in config.toml"))?;
         let max_attempts = self.config.max_reconnect_attempts.max(1);
         let base_interval = Duration::from_millis(self.config.reconnect_interval_ms);
 
         for attempt in 0..max_attempts {
-            match connect_async(&self.config.endpoint).await {
+            match connect_async(endpoint).await {
                 Ok((ws_stream, _)) => {
                     if attempt > 0 {
                         info!(
@@ -151,7 +156,7 @@ impl WsSttProvider {
                             attempt
                         );
                     } else {
-                        debug!("STT WebSocket connected to {}", self.config.endpoint);
+                        debug!("STT WebSocket connected to {}", endpoint);
                     }
                     return Ok(ws_stream);
                 }
@@ -160,7 +165,7 @@ impl WsSttProvider {
                     if remaining == 0 {
                         return Err(e).context(format!(
                             "failed to connect to STT server at {} after {max_attempts} attempts",
-                            self.config.endpoint
+                            endpoint
                         ));
                     }
                     let backoff = base_interval * 2u32.saturating_pow(attempt);
@@ -200,8 +205,9 @@ impl SttProvider for WsSttProvider {
         let json = serde_json::to_string(&config_msg)?;
         sink.send(Message::Text(json)).await?;
         debug!("sent STT config: {:?}", config_msg);
-        // Give server time to apply config (reference: onopen → send config then stream audio).
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Give bridge time to create page, inject script, connect page WS, apply config,
+        // getUserMedia, and start SpeechRecognition before we send PCM.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
 
         let sender = Box::new(WsSttSender { sink }) as Box<dyn SttSender>;
         let receiver = Box::new(WsSttReceiver { stream }) as Box<dyn SttReceiver>;
@@ -394,6 +400,23 @@ mod tests {
         }
     }
 
+    /// Regression test: the real STT server sends `timestamp_ms` as a float
+    /// (e.g. `1772040108975.286`).  Serde must not reject the message when the
+    /// JSON number has a fractional part; it should truncate to `u64`.
+    #[test]
+    fn parse_speech_start_float_timestamp() {
+        let json = r#"{"type":"speech_start","timestamp_ms":1772040108975.286}"#;
+        let msg: WsServerMessage = serde_json::from_str(json).unwrap();
+        let event = msg.into_stt_event().unwrap();
+        match event {
+            SttEvent::SpeechStart { timestamp_ms } => {
+                // Float truncates to integer part.
+                assert_eq!(timestamp_ms, 1772040108975_u64);
+            }
+            _ => panic!("expected SpeechStart"),
+        }
+    }
+
     #[test]
     fn parse_partial() {
         let json = r#"{"type":"partial","text":"こんに"}"#;
@@ -544,15 +567,24 @@ mod stt_server_tests {
     use std::time::Duration;
 
     /// Load STT WS config from config.toml (voice.stt.ws). Uses default if voice section missing.
+    /// If LOCALGPT_STT_WS_ENDPOINT is set (e.g. for testing stt-browser-bridge), overrides endpoint.
     fn stt_ws_config_from_app_config() -> VoiceSttWsConfig {
-        match Config::load() {
+        let mut config = match Config::load() {
             Ok(c) => c
                 .voice
                 .as_ref()
                 .map(|v| v.stt.ws.clone())
                 .unwrap_or_else(VoiceSttWsConfig::default),
             Err(_) => VoiceSttWsConfig::default(),
+        };
+        if let Ok(endpoint) = std::env::var("LOCALGPT_STT_WS_ENDPOINT") {
+            if !endpoint.is_empty() {
+                config.endpoint = Some(endpoint);
+                // stt-browser-bridge expects 16 kHz PCM; force sample_rate so fixture is resampled correctly.
+                config.sample_rate = 16000;
+            }
         }
+        config
     }
 
     /// Load tests/fixtures/stt_speech.wav and return mono f32 PCM at the given sample rate.
@@ -603,7 +635,11 @@ mod stt_server_tests {
         chunks: &[Vec<f32>],
         config: VoiceSttWsConfig,
     ) {
-        eprintln!("[STT test] endpoint={} sample_rate={}", config.endpoint, config.sample_rate);
+        eprintln!(
+            "[STT test] endpoint={} sample_rate={}",
+            config.endpoint.as_deref().unwrap_or("(not set)"),
+            config.sample_rate
+        );
         let provider = WsSttProvider::new(config);
         let (mut sender, mut receiver) = provider
             .connect()
@@ -617,7 +653,11 @@ mod stt_server_tests {
         eprintln!("[STT test] sent end_of_stream, waiting for results");
 
         let mut events = Vec::new();
-        let recv_timeout = Duration::from_secs(10);
+        let recv_timeout = if std::env::var("LOCALGPT_STT_WS_ENDPOINT").is_ok() {
+            Duration::from_secs(25)
+        } else {
+            Duration::from_secs(10)
+        };
         eprintln!("[STT test] entering recv loop (timeout {:?})", recv_timeout);
         loop {
             match tokio::time::timeout(recv_timeout, receiver.recv_event()).await {
@@ -647,6 +687,88 @@ mod stt_server_tests {
              check server and voice.stt.ws.endpoint in config",
             events.len(),
             events
+        );
+    }
+
+    /// stt-browser-bridge: connect, send config + PCM + end_of_stream, assert we get at least one
+    /// recognition event (partial or final). Use TTS-generated fixture (see tests/fixtures/README.md).
+    #[tokio::test]
+    #[ignore = "stt-browser-bridge required - LOCALGPT_STT_WS_ENDPOINT=ws://127.0.0.1:8765, BlackHole+sox or PCM path, --include-ignored"]
+    async fn stt_browser_bridge_accepts_fixture() {
+        let endpoint = match std::env::var("LOCALGPT_STT_WS_ENDPOINT") {
+            Ok(u) if !u.is_empty() => u,
+            _ => return,
+        };
+        let mut config = stt_ws_config_from_app_config();
+        config.endpoint = Some(endpoint.clone());
+        config.sample_rate = 16000;
+
+        let pcm = load_speech_wav_at_rate(config.sample_rate);
+        assert!(!pcm.is_empty(), "fixture WAV is empty");
+        let samples_20ms = (config.sample_rate as usize * 20) / 1000;
+        let chunks = chunk_pcm(&pcm, samples_20ms);
+
+        let provider = WsSttProvider::new(config);
+        let (mut sender, mut receiver) = provider
+            .connect()
+            .await
+            .expect("connect to bridge");
+        // Wait for bridge to create page, inject script, and start recognition
+        // before sending PCM. Too short = sox plays before recognition starts;
+        // too long = no-speech timeout fires before audio arrives.
+        eprintln!("[STT bridge test] waiting 2s for recognition to start...");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        eprintln!("[STT bridge test] sending {} chunks of PCM...", chunks.len());
+        for ch in &chunks {
+            sender.send_audio(ch).await.expect("send_audio");
+        }
+        sender.send_end_of_stream().await.expect("send_end_of_stream");
+
+        let recv_timeout = Duration::from_secs(20);
+        eprintln!("[STT bridge test] waiting for recognition events (timeout {:?})", recv_timeout);
+        let mut events = Vec::new();
+        loop {
+            match tokio::time::timeout(recv_timeout, receiver.recv_event()).await {
+                Ok(Ok(Some(ev))) => {
+                    eprintln!("[STT bridge test] event: {:?}", ev);
+                    events.push(ev.clone());
+                    if matches!(ev, SttEvent::Partial { .. } | SttEvent::Final { .. }) {
+                        eprintln!("[STT bridge test] *** got recognition: {:?}", ev);
+                    }
+                }
+                Ok(Ok(None)) => {
+                    eprintln!("[STT bridge test] stream ended (None)");
+                    break;
+                }
+                Ok(Err(e)) => panic!("recv_event error: {}", e),
+                Err(_) => {
+                    eprintln!("[STT bridge test] recv timeout after {:?}", recv_timeout);
+                    break;
+                }
+            }
+        }
+        sender.close().await.expect("close");
+
+        let recognition_count = events
+            .iter()
+            .filter(|e| match e {
+                SttEvent::Partial { text } => !text.is_empty(),
+                SttEvent::Final { text, .. } => !text.is_empty(),
+                _ => false,
+            })
+            .count();
+        eprintln!(
+            "[STT bridge test] fixture: tests/fixtures/stt_speech.wav; total events: {}, recognition (partial/final): {}",
+            events.len(),
+            recognition_count
+        );
+        for ev in &events {
+            eprintln!("  {:?}", ev);
+        }
+        assert!(
+            recognition_count >= 1,
+            "STT bridge must return at least one recognition event (partial or final); got 0. \
+             Use TTS-generated stt_speech.wav (tests/fixtures/README.md), BlackHole+sox or ensure PCM path works."
         );
     }
 

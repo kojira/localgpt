@@ -129,6 +129,8 @@ mod tests {
                 sample_rate: 48000,
                 duration_ms: 10.0,
             },
+            synthesis_started_at: std::time::Instant::now(),
+            tts_duration_ms: 0,
         }
     }
 

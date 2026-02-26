@@ -21,6 +21,10 @@ target
 #.idea/
 .DS_Store
 
+# Node (stt-browser-bridge)
+stt-browser-bridge/node_modules/
+stt-browser-bridge/debug_run.log
+
 # User data files (may be created during testing)
 .fastembed_cache/
 .*

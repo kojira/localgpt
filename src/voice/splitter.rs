@@ -106,11 +106,15 @@ impl SentenceSplitter {
                     }
                 }
 
-                // Split on paragraph break "\n\n".
-                while buffer.contains("\n\n") {
-                    let parts: Vec<&str> = buffer.splitn(2, "\n\n").collect();
+                // Split on single newline "\n" — each non-empty line becomes its own segment.
+                while buffer.contains('\n') {
+                    let parts: Vec<&str> = buffer.splitn(2, '\n').collect();
                     let sentence = parts[0].trim().to_string();
                     buffer = parts[1].to_string();
+                    if sentence.is_empty() {
+                        // Skip empty lines (blank lines between paragraphs).
+                        continue;
+                    }
                     if sentence.len() >= min_len {
                         let seg = SentenceSegment {
                             index: seq,
@@ -120,8 +124,8 @@ impl SentenceSplitter {
                         if tx.send(Ok(seg)).await.is_err() {
                             return;
                         }
-                    } else if !sentence.is_empty() {
-                        // Prepend back — will merge with next content.
+                    } else {
+                        // Below min_length — merge with next content.
                         buffer.insert_str(0, &format!("{sentence} "));
                     }
                 }
@@ -270,6 +274,24 @@ mod tests {
             split_into_sentences(input).collect::<Vec<_>>().await;
         // Should have exactly one error.
         assert!(results.iter().any(|r| r.is_err()));
+    }
+
+    #[tokio::test]
+    async fn split_on_single_newline() {
+        let input = tokens(&["Line one\nLine two"]);
+        let segs = collect_segments(split_into_sentences(input)).await;
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "Line one");
+        assert_eq!(segs[1].text, "Line two");
+    }
+
+    #[tokio::test]
+    async fn split_skips_empty_lines() {
+        let input = tokens(&["First\n\nSecond"]);
+        let segs = collect_segments(split_into_sentences(input)).await;
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "First");
+        assert_eq!(segs[1].text, "Second");
     }
 
     #[tokio::test]

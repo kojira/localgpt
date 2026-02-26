@@ -1,5 +1,12 @@
 # LocalGPT Configuration
 # Copy to ~/.localgpt/config.toml
+#
+# Dynamic config reload (daemon only):
+#   - SIGHUP: reload config from disk (Unix)
+#   - POST /api/reload: HTTP API
+#   - /reload-config: Telegram slash command or ask the bot to "reload config" (reload_config tool)
+#   - Reloaded on next use: agent.default_model, heartbeat.interval, heartbeat.enabled, etc.
+#   - Restart required for: server.port/bind, telegram.enabled/api_token, voice.enabled, Discord token
 
 [agent]
 # Default model to use for chat
@@ -169,10 +176,10 @@ file = "~/.localgpt/logs/agent.log"
 # idle_timeout_sec = 300          # Stop worker after 5 min silence
 #
 # [voice.stt]
-# provider = "ws"                 # "ws" (WebSocket to external STT server)
+# provider = "ws"                 # "ws" (WebSocket to external STT server, e.g. stt-server-mlx-whisper)
 #
 # [voice.stt.ws]
-# endpoint = "ws://127.0.0.1:8766/ws"
+# endpoint = "ws://127.0.0.1:8765"   # required (no default). e.g. stt-server-mlx-whisper, or stt-browser-bridge (npm start in stt-browser-bridge/)
 # reconnect_interval_ms = 1000
 # max_reconnect_attempts = 10
 #
@@ -180,9 +187,9 @@ file = "~/.localgpt/logs/agent.log"
 # provider = "aivis-speech"       # "aivis-speech" (VOICEVOX-compatible)
 #
 # [voice.tts.aivis_speech]
-# endpoint = "http://127.0.0.1:10101"
+# endpoint = "http://127.0.0.1:10101"   # required (no default)
 # model = "default"
-# speed_scale = 1.0
+# speed_scale = 1.0               # 再生速度 (1.0=等倍, 1.2=1.2倍速, 0.8=ゆっくり)
 # volume_scale = 1.0
 # format = "wav"                 # "wav" (PCM) or "opus" (if your API supports it)
 #

@@ -95,6 +95,17 @@ Access LocalGPT from Telegram with full chat, tool use, and memory support.
 
 Once paired, use `/help` in Telegram to see available commands.
 
+## Voice (Discord) and STT
+
+With the `voice` feature, LocalGPT can join Discord voice channels and use STT (speech-to-text). Set `voice.stt.provider = "ws"` and `voice.stt.ws.endpoint` to a WebSocket STT server (e.g. [stt-server-mlx-whisper](https://github.com/nicolas-martinez/stt-server-mlx-whisper)). To use the browser’s Web Speech API instead, run the **STT Browser Bridge** and point the endpoint to it:
+
+```bash
+cd stt-browser-bridge && npm install && npm start
+# Then set voice.stt.ws.endpoint = "ws://127.0.0.1:8765" in config.toml
+```
+
+See [stt-browser-bridge/README.md](stt-browser-bridge/README.md) for details (requires Chrome in headful mode or Xvfb on servers).
+
 ## CLI Commands
 
 ```bash

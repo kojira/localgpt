@@ -3,8 +3,7 @@
 use anyhow::Result;
 use chrono::{Local, NaiveTime};
 use std::fs;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
@@ -13,14 +12,11 @@ use crate::agent::{
     Agent, AgentConfig, HEARTBEAT_OK_TOKEN, SessionStore, build_heartbeat_prompt, is_heartbeat_ok,
 };
 use crate::concurrency::{TurnGate, WorkspaceLock};
-use crate::config::{Config, parse_duration, parse_time};
+use crate::config::{Config, SharedConfig, parse_duration, parse_time};
 use crate::memory::MemoryManager;
 
 pub struct HeartbeatRunner {
-    config: Config,
-    interval: Duration,
-    active_hours: Option<(NaiveTime, NaiveTime)>,
-    workspace: PathBuf,
+    shared_config: SharedConfig,
     agent_id: String,
     /// Cached MemoryManager to avoid reinitializing embedding provider on every heartbeat
     memory: MemoryManager,
@@ -32,52 +28,33 @@ pub struct HeartbeatRunner {
 
 impl HeartbeatRunner {
     /// Create a new HeartbeatRunner with the default agent ID ("main")
-    pub fn new(config: &Config) -> Result<Self> {
-        Self::new_with_agent(config, "main")
+    pub async fn new(config: &Config) -> Result<Self> {
+        Self::new_with_agent(config, "main").await
     }
 
-    /// Create a new HeartbeatRunner for a specific agent ID
-    pub fn new_with_agent(config: &Config, agent_id: &str) -> Result<Self> {
-        Self::new_with_gate(config, agent_id, None)
+    /// Create a new HeartbeatRunner for a specific agent ID (standalone, no daemon)
+    pub async fn new_with_agent(config: &Config, agent_id: &str) -> Result<Self> {
+        let shared =
+            std::sync::Arc::new(tokio::sync::RwLock::new(config.clone()));
+        Self::new_with_gate(shared, agent_id, None).await
     }
 
     /// Create a new HeartbeatRunner with an optional in-process TurnGate.
     ///
     /// When running inside the daemon alongside the HTTP server, pass a
-    /// shared `TurnGate` so heartbeat skips when an HTTP agent turn is active.
-    pub fn new_with_gate(
-        config: &Config,
+    /// shared `TurnGate` and `SharedConfig` so heartbeat uses the latest config each cycle.
+    pub async fn new_with_gate(
+        shared_config: SharedConfig,
         agent_id: &str,
         turn_gate: Option<TurnGate>,
     ) -> Result<Self> {
-        let interval = parse_duration(&config.heartbeat.interval)
-            .map_err(|e| anyhow::anyhow!("Invalid heartbeat interval: {}", e))?;
-
-        let active_hours = if let Some(ref hours) = config.heartbeat.active_hours {
-            let (start_h, start_m) = parse_time(&hours.start)
-                .map_err(|e| anyhow::anyhow!("Invalid start time: {}", e))?;
-            let (end_h, end_m) =
-                parse_time(&hours.end).map_err(|e| anyhow::anyhow!("Invalid end time: {}", e))?;
-
-            Some((
-                NaiveTime::from_hms_opt(start_h as u32, start_m as u32, 0).unwrap(),
-                NaiveTime::from_hms_opt(end_h as u32, end_m as u32, 0).unwrap(),
-            ))
-        } else {
-            None
-        };
-
-        let workspace = config.workspace_path();
-
-        // Create MemoryManager once and reuse it to avoid reinitializing embedding provider
-        let memory = MemoryManager::new_with_full_config(&config.memory, Some(config), agent_id)?;
+        let config = shared_config.read().await.clone();
+        let memory =
+            MemoryManager::new_with_full_config(&config.memory, Some(&config), agent_id)?;
         let workspace_lock = WorkspaceLock::new()?;
 
         Ok(Self {
-            config: config.clone(),
-            interval,
-            active_hours,
-            workspace,
+            shared_config,
             agent_id: agent_id.to_string(),
             memory,
             turn_gate,
@@ -87,17 +64,18 @@ impl HeartbeatRunner {
 
     /// Run the heartbeat loop continuously
     pub async fn run(&self) -> Result<()> {
-        info!(
-            "Starting heartbeat runner with interval: {:?}",
-            self.interval
-        );
+        let config = self.shared_config.read().await.clone();
+        let interval = parse_duration(&config.heartbeat.interval)
+            .map_err(|e| anyhow::anyhow!("Invalid heartbeat interval: {}", e))?;
+        info!("Starting heartbeat runner with interval: {:?}", interval);
 
         loop {
             // Sleep until next interval
-            sleep(self.interval).await;
+            sleep(interval).await;
 
-            // Check active hours
-            if !self.in_active_hours() {
+            // Check active hours (re-read config for dynamic reload)
+            let config = self.shared_config.read().await.clone();
+            if !Self::in_active_hours(&config) {
                 debug!("Outside active hours, skipping heartbeat");
                 emit_heartbeat_event(HeartbeatEvent {
                     ts: now_ms(),
@@ -109,9 +87,9 @@ impl HeartbeatRunner {
                 continue;
             }
 
-            // Run heartbeat with timing
+            // Run heartbeat with timing (use config already read for active_hours)
             let start = Instant::now();
-            match self.run_once_internal().await {
+            match self.run_once_internal(&config).await {
                 Ok((response, status)) => {
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let preview = if response.len() > 200 {
@@ -151,9 +129,10 @@ impl HeartbeatRunner {
 
     /// Run a single heartbeat cycle (public API, emits events)
     pub async fn run_once(&self) -> Result<String> {
+        let config = self.shared_config.read().await.clone();
         let start = Instant::now();
 
-        match self.run_once_internal().await {
+        match self.run_once_internal(&config).await {
             Ok((response, status)) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 let preview = if response.len() > 200 {
@@ -187,7 +166,7 @@ impl HeartbeatRunner {
     }
 
     /// Internal heartbeat execution (returns response and status)
-    async fn run_once_internal(&self) -> Result<(String, HeartbeatStatus)> {
+    async fn run_once_internal(&self, config: &Config) -> Result<(String, HeartbeatStatus)> {
         // Skip if an in-process agent turn is already in flight
         if let Some(ref gate) = self.turn_gate
             && gate.is_busy()
@@ -220,7 +199,8 @@ impl HeartbeatRunner {
         };
 
         // Check if HEARTBEAT.md exists and has content
-        let heartbeat_path = self.workspace.join("HEARTBEAT.md");
+        let workspace = config.workspace_path();
+        let heartbeat_path = workspace.join("HEARTBEAT.md");
 
         if !heartbeat_path.exists() {
             debug!("No HEARTBEAT.md found");
@@ -235,16 +215,16 @@ impl HeartbeatRunner {
 
         // Create agent for heartbeat (clone the cached MemoryManager to share the embedding provider)
         let agent_config = AgentConfig {
-            model: self.config.agent.default_model.clone(),
-            context_window: self.config.agent.context_window,
-            reserve_tokens: self.config.agent.reserve_tokens,
+            model: config.agent.default_model.clone(),
+            context_window: config.agent.context_window,
+            reserve_tokens: config.agent.reserve_tokens,
         };
 
-        let mut agent = Agent::new(agent_config, &self.config, self.memory.clone()).await?;
+        let mut agent = Agent::new(agent_config, config, self.memory.clone(), None).await?;
         agent.new_session().await?;
 
         // Check if workspace is a git repo
-        let workspace_is_git = self.workspace.join(".git").exists();
+        let workspace_is_git = workspace.join(".git").exists();
 
         // Send heartbeat prompt
         let heartbeat_prompt = build_heartbeat_prompt(workspace_is_git);
@@ -282,8 +262,15 @@ impl HeartbeatRunner {
         Ok((response, HeartbeatStatus::Sent))
     }
 
-    fn in_active_hours(&self) -> bool {
-        let Some((start, end)) = self.active_hours else {
+    fn in_active_hours(config: &Config) -> bool {
+        let Some((start, end)) = config.heartbeat.active_hours.as_ref().and_then(|hours| {
+            let (start_h, start_m) = parse_time(&hours.start).ok()?;
+            let (end_h, end_m) = parse_time(&hours.end).ok()?;
+            Some((
+                NaiveTime::from_hms_opt(start_h as u32, start_m as u32, 0)?,
+                NaiveTime::from_hms_opt(end_h as u32, end_m as u32, 0)?,
+            ))
+        }) else {
             return true; // No active hours configured, always active
         };
 

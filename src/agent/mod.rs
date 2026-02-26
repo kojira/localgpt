@@ -87,7 +87,7 @@ pub fn clean_claude_cli_sessions(workspace: &std::path::Path) {
     }
 }
 
-use crate::config::Config;
+use crate::config::{Config, SharedConfig};
 use crate::memory::{MemoryChunk, MemoryManager};
 
 /// Soft threshold buffer before compaction (tokens)
@@ -144,12 +144,13 @@ impl Agent {
         config: AgentConfig,
         app_config: &Config,
         memory: MemoryManager,
+        shared_config: Option<SharedConfig>,
     ) -> Result<Self> {
         let provider = providers::create_provider(&config.model, app_config)?;
 
         // Wrap memory in Arc so tools can share it
         let memory = Arc::new(memory);
-        let tools = tools::create_default_tools(app_config, Some(Arc::clone(&memory)))?;
+        let tools = tools::create_default_tools(app_config, Some(Arc::clone(&memory)), shared_config)?;
 
         // Load and verify security policy
         let workspace = app_config.workspace_path();

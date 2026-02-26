@@ -30,7 +30,7 @@ pub async fn run(args: AskArgs, agent_id: &str) -> Result<()> {
         reserve_tokens: config.agent.reserve_tokens,
     };
 
-    let mut agent = Agent::new(agent_config, &config, memory).await?;
+    let mut agent = Agent::new(agent_config, &config, memory, None).await?;
     agent.new_session().await?;
 
     let workspace_lock = WorkspaceLock::new()?;

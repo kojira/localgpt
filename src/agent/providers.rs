@@ -1377,8 +1377,22 @@ impl ClaudeCliProvider {
                     *cli_session = None;
                 }
             } else {
-                // Some other error - propagate it
-                anyhow::bail!("Claude CLI failed: {}", stderr);
+                // Some other error - propagate it (include exit code and stdout if stderr empty)
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let code = output.status.code().unwrap_or(-1);
+                let msg = if stderr.is_empty() && stdout.is_empty() {
+                    format!("exit_code={}", code)
+                } else if stderr.is_empty() {
+                    let s = stdout.trim();
+                    if s.contains("Not logged in") || s.contains("Please run /login") {
+                        "The claude command reported: not logged in. If you use Claude Code, run `claude` then type /login in the session. Otherwise log in with the method for your installed client.".to_string()
+                    } else {
+                        format!("exit_code={} stdout={}", code, s)
+                    }
+                } else {
+                    format!("{}", stderr)
+                };
+                anyhow::bail!("Claude CLI failed: {}", msg);
             }
         }
 
@@ -1405,7 +1419,21 @@ impl ClaudeCliProvider {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Claude CLI failed: {}", stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let code = output.status.code().unwrap_or(-1);
+            let msg = if stderr.is_empty() && stdout.is_empty() {
+                format!("exit_code={}", code)
+            } else if stderr.is_empty() {
+                let s = stdout.trim();
+                if s.contains("Not logged in") || s.contains("Please run /login") {
+                    "The claude command reported: not logged in. If you use Claude Code, run `claude` then type /login in the session. Otherwise log in with the method for your installed client.".to_string()
+                } else {
+                    format!("exit_code={} stdout={}", code, s)
+                }
+            } else {
+                format!("{}", stderr)
+            };
+            anyhow::bail!("Claude CLI failed: {}", msg);
         }
 
         Ok((output, true))

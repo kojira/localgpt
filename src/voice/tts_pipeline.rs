@@ -9,10 +9,60 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, Semaphore};
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use super::provider::{TtsProvider, TtsResult};
 use super::splitter::SentenceSegment;
+
+/// Returns `true` if `c` is an emoji or emoji-related character.
+fn is_emoji_char_tts(c: char) -> bool {
+    let cp = c as u32;
+    if cp >= 0x1F000 {
+        return true;
+    }
+    matches!(cp,
+        0x00A9 | 0x00AE |
+        0x203C | 0x2049 |
+        0x2122 | 0x2139 |
+        0x2194..=0x2199 |
+        0x21A9..=0x21AA |
+        0x231A..=0x231B |
+        0x2328 | 0x23CF |
+        0x23E9..=0x23F3 |
+        0x23F8..=0x23FA |
+        0x24C2 |
+        0x25AA..=0x25AB |
+        0x25B6 | 0x25C0 |
+        0x25FB..=0x25FE |
+        0x2600..=0x27BF |
+        0x2934..=0x2935 |
+        0x2B05..=0x2B07 |
+        0x2B1B..=0x2B1C |
+        0x2B50 | 0x2B55 |
+        0x3030 | 0x303D |
+        0x3297 | 0x3299 |
+        0xFE00..=0xFE0F |
+        0x200D | 0x20E3
+    )
+}
+
+/// Returns `true` if a TTS segment should be skipped (not synthesized).
+///
+/// Skips:
+/// * Empty text
+/// * `NO_REPLY` marker (OpenClaw agent signal)
+/// * Emoji-only lines (would be read aloud awkwardly by TTS)
+fn should_skip_tts_segment(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if t == "NO_REPLY" {
+        return true;
+    }
+    // Emoji-only: all chars are emoji or spaces
+    t.chars().all(|c| is_emoji_char_tts(c) || c == ' ')
+}
 
 /// Default maximum number of concurrent TTS requests.
 const DEFAULT_MAX_CONCURRENT: usize = 3;
@@ -26,6 +76,11 @@ pub struct TtsSegment {
     pub text: String,
     /// TTS synthesis result (PCM audio).
     pub tts_result: TtsResult,
+    /// When TTS synthesis started (= when the LLM segment was ready to be synthesized).
+    /// Carry this to the playback loop so profiling can compute accurate elapsed-from-speech-start.
+    pub synthesis_started_at: std::time::Instant,
+    /// Duration of TTS synthesis in milliseconds.
+    pub tts_duration_ms: u64,
 }
 
 /// Parallel TTS pipeline that respects a concurrency limit.
@@ -74,6 +129,12 @@ impl TtsPipeline {
                     }
                 };
 
+                // Skip segments that should not be synthesized.
+                if should_skip_tts_segment(&seg.text) {
+                    debug!(index = seg.index, text = %seg.text, "TTS skipped segment[{}]", seg.index);
+                    continue;
+                }
+
                 let permit = match sem.clone().acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => break, // semaphore closed
@@ -85,15 +146,36 @@ impl TtsPipeline {
                 tokio::spawn(async move {
                     let _permit = permit; // held until this task completes
 
+                    // Log: LLM produced this segment (SentenceSplitter confirmed the boundary).
+                    // Full text without truncation so split quality is visible in logs.
+                    info!(
+                        segment = seg.index,
+                        text = %seg.text,
+                        "LLM segment[{}]: \"{}\"",
+                        seg.index,
+                        seg.text
+                    );
+
+                    // Capture synthesis start time — this is also the "LLM segment ready" time.
+                    let synthesis_started_at = std::time::Instant::now();
                     debug!(index = seg.index, text = %seg.text, "TTS synthesis started");
 
                     match tts_clone.synthesize(&seg.text).await {
                         Ok(tts_result) => {
-                            debug!(index = seg.index, "TTS synthesis completed");
+                            let tts_duration_ms = synthesis_started_at.elapsed().as_millis() as u64;
+                            info!(
+                                segment = seg.index,
+                                tts_duration_ms,
+                                "TTS segment[{}] done in {}ms",
+                                seg.index,
+                                tts_duration_ms
+                            );
                             let tts_seg = TtsSegment {
                                 index: seg.index,
                                 text: seg.text,
                                 tts_result,
+                                synthesis_started_at,
+                                tts_duration_ms,
                             };
                             let _ = tx_clone.send(Ok(tts_seg)).await;
                         }
@@ -201,6 +283,64 @@ mod tests {
             crate::voice::provider::TtsResult::Pcm { audio, .. } => assert!(!audio.is_empty()),
             crate::voice::provider::TtsResult::EncodedOpus { data, .. } => assert!(!data.is_empty()),
         }
+    }
+
+    #[tokio::test]
+    async fn pipeline_skips_empty_segments() {
+        let tts: Arc<dyn TtsProvider> = Arc::new(MockTtsProvider::silent());
+        let pipeline = TtsPipeline::with_defaults(tts);
+
+        let input = stream::iter(vec![
+            Ok(SentenceSegment { index: 0, text: "".to_string() }),
+            Ok(SentenceSegment { index: 1, text: "Hello!".to_string() }),
+        ]);
+        let mut rx = pipeline.process(input);
+
+        let mut results = Vec::new();
+        while let Some(item) = rx.recv().await {
+            results.push(item.unwrap());
+        }
+        // Only the non-empty segment should be processed
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].text, "Hello!");
+    }
+
+    #[tokio::test]
+    async fn pipeline_skips_no_reply() {
+        let tts: Arc<dyn TtsProvider> = Arc::new(MockTtsProvider::silent());
+        let pipeline = TtsPipeline::with_defaults(tts);
+
+        let input = stream::iter(vec![
+            Ok(SentenceSegment { index: 0, text: "NO_REPLY".to_string() }),
+            Ok(SentenceSegment { index: 1, text: "Hello!".to_string() }),
+        ]);
+        let mut rx = pipeline.process(input);
+
+        let mut results = Vec::new();
+        while let Some(item) = rx.recv().await {
+            results.push(item.unwrap());
+        }
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].text, "Hello!");
+    }
+
+    #[tokio::test]
+    async fn pipeline_skips_emoji_only() {
+        let tts: Arc<dyn TtsProvider> = Arc::new(MockTtsProvider::silent());
+        let pipeline = TtsPipeline::with_defaults(tts);
+
+        let input = stream::iter(vec![
+            Ok(SentenceSegment { index: 0, text: "🎉".to_string() }),
+            Ok(SentenceSegment { index: 1, text: "Hello!".to_string() }),
+        ]);
+        let mut rx = pipeline.process(input);
+
+        let mut results = Vec::new();
+        while let Some(item) = rx.recv().await {
+            results.push(item.unwrap());
+        }
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].text, "Hello!");
     }
 
     #[tokio::test]

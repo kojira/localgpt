@@ -9,6 +9,23 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::info;
+
+/// Shared config for dynamic reload. Daemon and services hold Arc clone and read/write via RwLock.
+pub type SharedConfig = Arc<RwLock<Config>>;
+
+/// Reload config from disk and replace the shared instance. Call after SIGHUP or from API/tool.
+pub async fn reload_shared(shared: &SharedConfig) -> Result<()> {
+    let new_config = Config::load()?;
+    {
+        let mut guard = shared.write().await;
+        *guard = new_config;
+    }
+    info!("Config reloaded from disk");
+    Ok(())
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -161,8 +178,9 @@ impl Default for VoiceSttConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoiceSttWsConfig {
-    #[serde(default = "default_voice_stt_ws_endpoint")]
-    pub endpoint: String,
+    /// WebSocket URL. Must be set in config (no default).
+    #[serde(default)]
+    pub endpoint: Option<String>,
 
     #[serde(default = "default_voice_stt_ws_sample_rate")]
     pub sample_rate: u32,
@@ -185,7 +203,7 @@ fn default_voice_stt_ws_sample_rate() -> u32 {
 impl Default for VoiceSttWsConfig {
     fn default() -> Self {
         Self {
-            endpoint: default_voice_stt_ws_endpoint(),
+            endpoint: None,
             sample_rate: default_voice_stt_ws_sample_rate(),
             reconnect_interval_ms: default_voice_stt_reconnect_interval(),
             max_reconnect_attempts: default_voice_stt_max_reconnect(),
@@ -214,8 +232,9 @@ impl Default for VoiceTtsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoiceTtsAivisSpeechConfig {
-    #[serde(default = "default_voice_tts_aivis_endpoint")]
-    pub endpoint: String,
+    /// TTS API base URL. Must be set in config (no default).
+    #[serde(default)]
+    pub endpoint: Option<String>,
 
     #[serde(default = "default_voice_tts_aivis_model")]
     pub model: String,
@@ -239,7 +258,7 @@ fn default_voice_tts_aivis_format() -> String {
 impl Default for VoiceTtsAivisSpeechConfig {
     fn default() -> Self {
         Self {
-            endpoint: default_voice_tts_aivis_endpoint(),
+            endpoint: None,
             model: default_voice_tts_aivis_model(),
             speed_scale: default_voice_tts_speed_scale(),
             volume_scale: default_voice_tts_volume_scale(),
@@ -760,9 +779,6 @@ fn default_voice_idle_timeout() -> u64 {
 fn default_voice_stt_provider() -> String {
     "ws".to_string()
 }
-fn default_voice_stt_ws_endpoint() -> String {
-    "ws://100.89.44.63/ws".to_string()
-}
 fn default_voice_stt_reconnect_interval() -> u64 {
     1000
 }
@@ -771,9 +787,6 @@ fn default_voice_stt_max_reconnect() -> u32 {
 }
 fn default_voice_tts_provider() -> String {
     "aivis-speech".to_string()
-}
-fn default_voice_tts_aivis_endpoint() -> String {
-    "http://127.0.0.1:8001".to_string()
 }
 fn default_voice_tts_aivis_model() -> String {
     "donchan".to_string()

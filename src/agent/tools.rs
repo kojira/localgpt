@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::providers::ToolSchema;
-use crate::config::Config;
+use crate::config::{reload_shared, Config, SharedConfig};
 use crate::memory::MemoryManager;
 use crate::sandbox::{self, SandboxPolicy};
 
@@ -27,6 +27,7 @@ pub trait Tool: Send + Sync {
 pub fn create_default_tools(
     config: &Config,
     memory: Option<Arc<MemoryManager>>,
+    shared_config: Option<SharedConfig>,
 ) -> Result<Vec<Box<dyn Tool>>> {
     let workspace = config.workspace_path();
     let state_dir = workspace
@@ -63,7 +64,7 @@ pub fn create_default_tools(
         Box::new(MemorySearchTool::new(workspace.clone()))
     };
 
-    Ok(vec![
+    let mut tool_list: Vec<Box<dyn Tool>> = vec![
         Box::new(BashTool::new(
             config.tools.bash_timeout_ms,
             state_dir.clone(),
@@ -78,7 +79,46 @@ pub fn create_default_tools(
         memory_search_tool,
         Box::new(MemoryGetTool::new(workspace)),
         Box::new(WebFetchTool::new(config.tools.web_fetch_max_bytes)),
-    ])
+    ];
+    if let Some(shared) = shared_config {
+        tool_list.push(Box::new(ReloadConfigTool::new(shared)));
+    }
+    Ok(tool_list)
+}
+
+/// Tool to reload config from disk (daemon only). Registered only when SharedConfig is provided.
+pub struct ReloadConfigTool {
+    shared: SharedConfig,
+}
+
+impl ReloadConfigTool {
+    pub fn new(shared: SharedConfig) -> Self {
+        Self { shared }
+    }
+}
+
+#[async_trait]
+impl Tool for ReloadConfigTool {
+    fn name(&self) -> &str {
+        "reload_config"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "reload_config".to_string(),
+            description: "Reload configuration from disk. Use when the user asks to reload or re-read config.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+
+    async fn execute(&self, _arguments: &str) -> Result<String> {
+        reload_shared(&self.shared).await?;
+        Ok("設定を再読み込みしました。".to_string())
+    }
 }
 
 // Bash Tool

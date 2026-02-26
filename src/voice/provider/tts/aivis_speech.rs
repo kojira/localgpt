@@ -45,7 +45,12 @@ impl AivisSpeechProvider {
 #[async_trait]
 impl TtsProvider for AivisSpeechProvider {
     async fn synthesize(&self, text: &str) -> Result<TtsResult> {
-        let base = self.config.endpoint.trim_end_matches('/');
+        let base = self
+            .config
+            .endpoint
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("voice.tts.aivis_speech.endpoint must be set in config.toml"))?
+            .trim_end_matches('/');
         let format = self.config.format.to_lowercase();
 
         if format == "opus" {
@@ -275,14 +280,14 @@ mod tests {
     #[test]
     fn constructor_stores_config() {
         let config = VoiceTtsAivisSpeechConfig {
-            endpoint: "http://localhost:9999".to_string(),
+            endpoint: Some("http://localhost:9999".to_string()),
             model: "testmodel".to_string(),
             speed_scale: 2.0,
             volume_scale: 0.7,
             format: "wav".to_string(),
         };
         let provider = AivisSpeechProvider::new(config);
-        assert_eq!(provider.config.endpoint, "http://localhost:9999");
+        assert_eq!(provider.config.endpoint.as_deref(), Some("http://localhost:9999"));
         assert_eq!(provider.config.model, "testmodel");
         assert_eq!(provider.config.speed_scale, 2.0);
         assert_eq!(provider.config.volume_scale, 0.7);

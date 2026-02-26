@@ -37,7 +37,7 @@ LocalGPT is a local-only AI assistant with persistent markdown-based memory and 
   - `session_store.rs` - Session metadata store (`sessions.json`) with CLI session ID persistence
   - `system_prompt.rs` - Builds system prompt with identity, safety, workspace info, tools, skills, and special tokens
   - `skills.rs` - Loads SKILL.md files from workspace/skills/ for specialized task handling
-  - `tools.rs` - Agent tools: `bash`, `read_file`, `write_file`, `edit_file`, `memory_search`, `memory_get`, `web_fetch`
+  - `tools.rs` - Agent tools: `bash`, `read_file`, `write_file`, `edit_file`, `memory_search`, `memory_get`, `web_fetch`, `reload_config` (daemon only)
 
 - **memory/** - Markdown-based knowledge store
   - `index.rs` - SQLite FTS5 index for fast search. Chunks files (~400 tokens with 80 token overlap)
@@ -51,7 +51,7 @@ LocalGPT is a local-only AI assistant with persistent markdown-based memory and 
 - **server/** - HTTP/WebSocket API and Telegram bot
   - `http.rs` - Axum-based REST API. Note: creates new Agent per request (no session persistence via HTTP)
   - `telegram.rs` - Telegram bot interface with one-time pairing auth, per-chat sessions, streaming responses with debounced message edits (2s), and full tool support
-  - Endpoints: `/health`, `/api/status`, `/api/chat`, `/api/memory/search`, `/api/memory/stats`
+  - Endpoints: `/health`, `/api/status`, `/api/chat`, `/api/memory/search`, `/api/memory/stats`, `POST /api/reload` (reload config)
 
 - **config/** - TOML configuration at `~/.localgpt/config.toml`
   - Supports `${ENV_VAR}` expansion in API keys
@@ -78,6 +78,8 @@ Default config path: `~/.localgpt/config.toml` (see `config.example.toml`)
 Key settings:
 - `agent.default_model` - Model name (determines provider). Default: `claude-cli/opus`. Supported: Anthropic (`anthropic/claude-*`), OpenAI (`openai/gpt-*`), GLM/Z.AI (`glm/glm-4.7` or alias `glm`), Claude CLI (`claude-cli/*`), Ollama (`ollama/*`)
 - `agent.context_window` / `reserve_tokens` - Context management
+
+**Dynamic config reload (daemon only):** When running `localgpt daemon start`, config can be reloaded without restart. Triggers: SIGHUP (Unix), `POST /api/reload`, Telegram `/reload-config` or bot tool `reload_config`. Reload applies to agent model, heartbeat interval, etc. on next use. Restart still required for: `server.port`/`bind`, `telegram.enabled`/`api_token`, `voice.enabled`, Discord token.
 - `memory.workspace` - Workspace directory path. Default: `~/.localgpt/workspace`
 - `heartbeat.interval` - Duration string (e.g., "30m", "1h")
 - `heartbeat.active_hours` - Optional `{start, end}` in "HH:MM" format

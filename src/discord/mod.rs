@@ -412,7 +412,7 @@ impl DiscordBot {
                         "discord",
                     )?;
                     let mut agent =
-                        Agent::new(agent_config, &config_clone, memory).await?;
+                        Agent::new(agent_config, &config_clone, memory, None).await?;
                     agent.new_session().await?;
                     agents_guard.insert(channel_id_owned.clone(), agent);
                     info!("Created new Agent for channel {}", channel_id_owned);

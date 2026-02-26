@@ -72,6 +72,16 @@ mod tests {
             tokio::time::sleep(self.delay).await;
             Ok(self.response.clone())
         }
+        async fn generate_stream(
+            &self,
+            _user_id: u64,
+            _text: &str,
+        ) -> anyhow::Result<std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>>> {
+            tokio::time::sleep(self.delay).await;
+            let token = self.response.clone();
+            let items: Vec<anyhow::Result<String>> = vec![Ok(token)];
+            Ok(Box::pin(futures::stream::iter(items)))
+        }
         async fn reset_context(&self, _user_id: u64) -> anyhow::Result<()> {
             Ok(())
         }
@@ -82,6 +92,16 @@ mod tests {
         ) -> anyhow::Result<String> {
             tokio::time::sleep(self.delay).await;
             Ok(self.response.clone())
+        }
+        async fn generate_room_stream(
+            &self,
+            _room_id: u64,
+            _messages: &[crate::voice::agent_bridge::RoomMessage],
+        ) -> anyhow::Result<std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>>> {
+            tokio::time::sleep(self.delay).await;
+            let token = self.response.clone();
+            let items: Vec<anyhow::Result<String>> = vec![Ok(token)];
+            Ok(Box::pin(futures::stream::iter(items)))
         }
     }
 
@@ -108,6 +128,22 @@ mod tests {
                 Ok(responses.remove(0))
             }
         }
+        async fn generate_stream(
+            &self,
+            _user_id: u64,
+            _text: &str,
+        ) -> anyhow::Result<std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>>> {
+            let token = {
+                let mut responses = self.responses.lock().unwrap();
+                if responses.is_empty() {
+                    "default response".to_string()
+                } else {
+                    responses.remove(0)
+                }
+            };
+            let items: Vec<anyhow::Result<String>> = vec![Ok(token)];
+            Ok(Box::pin(futures::stream::iter(items)))
+        }
         async fn reset_context(&self, _user_id: u64) -> anyhow::Result<()> {
             Ok(())
         }
@@ -122,6 +158,22 @@ mod tests {
             } else {
                 Ok(responses.remove(0))
             }
+        }
+        async fn generate_room_stream(
+            &self,
+            _room_id: u64,
+            _messages: &[crate::voice::agent_bridge::RoomMessage],
+        ) -> anyhow::Result<std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>>> {
+            let token = {
+                let mut responses = self.responses.lock().unwrap();
+                if responses.is_empty() {
+                    "default response".to_string()
+                } else {
+                    responses.remove(0)
+                }
+            };
+            let items: Vec<anyhow::Result<String>> = vec![Ok(token)];
+            Ok(Box::pin(futures::stream::iter(items)))
         }
     }
 

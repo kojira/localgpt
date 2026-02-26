@@ -125,7 +125,7 @@ pub async fn run(args: ChatArgs, agent_id: &str) -> Result<()> {
         reserve_tokens: config.agent.reserve_tokens,
     };
 
-    let mut agent = Agent::new(agent_config, &config, memory).await?;
+    let mut agent = Agent::new(agent_config, &config, memory, None).await?;
     let workspace_lock = WorkspaceLock::new()?;
 
     // Determine session to use
@@ -764,6 +764,11 @@ async fn handle_command(
             }
             Err(e) => CommandResult::Error(format!("Failed to save session: {}", e)),
         },
+
+        "/reload-config" => {
+            println!("\nConfig reload is only available when running the daemon (use SIGHUP or POST /api/reload).\n");
+            CommandResult::Continue
+        }
 
         "/status" => {
             let status = agent.session_status();

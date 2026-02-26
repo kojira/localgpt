@@ -1,0 +1,17 @@
+{
+  "name": "stt-browser-bridge",
+  "version": "0.1.0",
+  "description": "Bridge: localgpt STT WebSocket protocol over browser Web Speech API (Puppeteer + virtual audio device)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "puppeteer": "^23.0.0",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

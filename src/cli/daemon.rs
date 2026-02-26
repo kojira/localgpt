@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use daemonize::Daemonize;
 
 use localgpt::concurrency::TurnGate;
-use localgpt::config::Config;
+use localgpt::config::{reload_shared, Config, SharedConfig};
 use localgpt::discord::SharedAgentMap;
 use localgpt::heartbeat::HeartbeatRunner;
 use localgpt::memory::MemoryManager;
@@ -137,7 +137,8 @@ async fn run_daemon_server(config: Config, agent_id: &str) -> Result<()> {
 
     println!("Daemon started successfully");
 
-    run_daemon_services(&config, agent_id).await?;
+    let shared_config = std::sync::Arc::new(tokio::sync::RwLock::new(config));
+    run_daemon_services(shared_config, agent_id).await?;
 
     println!("\nShutting down...");
     let pid_file = get_pid_file()?;
@@ -147,7 +148,33 @@ async fn run_daemon_server(config: Config, agent_id: &str) -> Result<()> {
 }
 
 /// Run daemon services (server and/or heartbeat)
-async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
+async fn run_daemon_services(shared_config: SharedConfig, agent_id: &str) -> Result<()> {
+    let config = shared_config.read().await.clone();
+
+    // Spawn SIGHUP handler for config reload (Unix only)
+    #[cfg(unix)]
+    {
+        let reload_config = shared_config.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sig = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Could not register SIGHUP handler: {}", e);
+                    return;
+                }
+            };
+            loop {
+                if sig.recv().await.is_none() {
+                    break;
+                }
+                if let Err(e) = reload_shared(&reload_config).await {
+                    tracing::error!("Config reload failed: {}", e);
+                }
+            }
+        });
+    }
+
     // Create shared turn gate for heartbeat + HTTP concurrency control
     let turn_gate = TurnGate::new();
 
@@ -182,13 +209,13 @@ async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
 
         #[cfg(feature = "voice")]
         let start_result = if voice_manager.is_some() {
-            localgpt::discord::start_with_voice(config, Some(agents.clone()), voice_manager).await
+            localgpt::discord::start_with_voice(&config, Some(agents.clone()), voice_manager).await
         } else {
-            localgpt::discord::start(config, Some(agents.clone())).await
+            localgpt::discord::start(&config, Some(agents.clone())).await
         };
 
         #[cfg(not(feature = "voice"))]
-        let start_result = localgpt::discord::start(config, Some(agents.clone())).await;
+        let start_result = localgpt::discord::start(&config, Some(agents.clone())).await;
 
         match start_result {
             Ok(handle) => {
@@ -216,7 +243,7 @@ async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
 
     // Spawn heartbeat in background if enabled
     let heartbeat_handle = if config.heartbeat.enabled {
-        let heartbeat_config = config.clone();
+        let heartbeat_shared = shared_config.clone();
         let heartbeat_agent_id = agent_id.to_string();
         let heartbeat_gate = turn_gate.clone();
         println!(
@@ -225,10 +252,12 @@ async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
         );
         Some(tokio::spawn(async move {
             match HeartbeatRunner::new_with_gate(
-                &heartbeat_config,
+                heartbeat_shared,
                 &heartbeat_agent_id,
                 Some(heartbeat_gate),
-            ) {
+            )
+            .await
+            {
                 Ok(runner) => {
                     if let Err(e) = runner.run().await {
                         tracing::error!("Heartbeat runner error: {}", e);
@@ -246,10 +275,13 @@ async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
     // Spawn Telegram bot in background if configured
     let telegram_handle = if config.telegram.as_ref().is_some_and(|t| t.enabled) {
         let tg_config = config.clone();
+        let tg_shared = shared_config.clone();
         let tg_gate = turn_gate.clone();
         println!("  Telegram: enabled");
         Some(tokio::spawn(async move {
-            if let Err(e) = localgpt::server::telegram::run_telegram_bot(&tg_config, tg_gate).await
+            if let Err(e) =
+                localgpt::server::telegram::run_telegram_bot(&tg_config, Some(tg_shared), tg_gate)
+                    .await
             {
                 tracing::error!("Telegram bot error: {}", e);
             }
@@ -264,7 +296,7 @@ async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
             "  Server: http://{}:{}",
             config.server.bind, config.server.port
         );
-        let mut server = Server::new_with_gate(config, turn_gate)?;
+        let mut server = Server::new_with_gate(shared_config.clone(), turn_gate)?;
         if let Some(agents) = discord_agents {
             server = server.with_discord_agents(agents);
         }
@@ -376,7 +408,8 @@ async fn start_daemon(foreground: bool, agent_id: &str) -> Result<()> {
 
     println!("Daemon started successfully");
 
-    run_daemon_services(&config, agent_id).await?;
+    let shared_config = std::sync::Arc::new(tokio::sync::RwLock::new(config));
+    run_daemon_services(shared_config, agent_id).await?;
 
     println!("\nShutting down...");
     fs::remove_file(&pid_file).ok();
@@ -517,7 +550,7 @@ async fn show_status() -> Result<()> {
 
 async fn run_heartbeat_once(agent_id: &str) -> Result<()> {
     let config = Config::load()?;
-    let runner = HeartbeatRunner::new_with_agent(&config, agent_id)?;
+    let runner = HeartbeatRunner::new_with_agent(&config, agent_id).await?;
 
     println!("Running heartbeat (agent: {})...", agent_id);
     let result = runner.run_once().await?;

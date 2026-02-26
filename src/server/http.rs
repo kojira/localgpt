@@ -32,7 +32,7 @@ use tracing::{debug, info};
 
 use crate::agent::{Agent, AgentConfig, StreamEvent, extract_tool_detail};
 use crate::concurrency::{TurnGate, WorkspaceLock};
-use crate::config::Config;
+use crate::config::{reload_shared, Config, SharedConfig};
 use crate::discord::SharedAgentMap;
 use crate::heartbeat::{HeartbeatStatus, get_last_heartbeat_event};
 use crate::memory::MemoryManager;
@@ -52,7 +52,7 @@ const MAX_SESSIONS: usize = 100;
 const HTTP_AGENT_ID: &str = "http";
 
 pub struct Server {
-    config: Config,
+    config: SharedConfig,
     turn_gate: TurnGate,
     discord_agents: Option<SharedAgentMap>,
 }
@@ -65,7 +65,7 @@ struct SessionEntry {
 }
 
 struct AppState {
-    config: Config,
+    config: SharedConfig,
     sessions: Mutex<HashMap<String, SessionEntry>>,
     /// Shared MemoryManager to avoid reinitializing embedding provider
     memory: MemoryManager,
@@ -79,18 +79,14 @@ struct AppState {
 
 impl Server {
     pub fn new(config: &Config) -> Result<Self> {
-        Ok(Self {
-            config: config.clone(),
-            turn_gate: TurnGate::new(),
-            discord_agents: None,
-        })
+        Self::new_with_gate(Arc::new(tokio::sync::RwLock::new(config.clone())), TurnGate::new())
     }
 
     /// Create a server with a shared TurnGate (for daemon mode where
     /// heartbeat and HTTP share concurrency control).
-    pub fn new_with_gate(config: &Config, turn_gate: TurnGate) -> Result<Self> {
+    pub fn new_with_gate(shared_config: SharedConfig, turn_gate: TurnGate) -> Result<Self> {
         Ok(Self {
-            config: config.clone(),
+            config: shared_config,
             turn_gate,
             discord_agents: None,
         })
@@ -103,9 +99,10 @@ impl Server {
     }
 
     pub async fn run(&self) -> Result<()> {
+        let config = self.config.read().await.clone();
         // Create shared MemoryManager once to avoid reinitializing embedding provider
         let memory =
-            MemoryManager::new_with_full_config(&self.config.memory, Some(&self.config), "main")?;
+            MemoryManager::new_with_full_config(&config.memory, Some(&config), HTTP_AGENT_ID)?;
 
         let workspace_lock = WorkspaceLock::new()?;
 
@@ -172,6 +169,7 @@ impl Server {
             .route("/api/memory/stats", get(memory_stats))
             .route("/api/memory/reindex", post(memory_reindex))
             .route("/api/status", get(status))
+            .route("/api/reload", post(reload_config))
             .route("/api/config", get(get_config))
             .route("/api/heartbeat/status", get(heartbeat_status))
             .route("/api/saved-sessions", get(list_saved_sessions))
@@ -181,7 +179,7 @@ impl Server {
             .with_state(state);
 
         let addr: SocketAddr =
-            format!("{}:{}", self.config.server.bind, self.config.server.port).parse()?;
+            format!("{}:{}", config.server.bind, config.server.port).parse()?;
 
         info!("Starting HTTP server on http://{}", addr);
 
@@ -224,17 +222,18 @@ async fn cleanup_expired_sessions(state: &Arc<AppState>) {
 async fn load_persisted_sessions(state: &Arc<AppState>) -> Result<(), anyhow::Error> {
     use crate::agent::list_sessions_for_agent;
 
+    let config = state.config.read().await.clone();
     let sessions_list = list_sessions_for_agent(HTTP_AGENT_ID)?;
     let mut loaded = 0;
 
     for session_info in sessions_list.into_iter().take(MAX_SESSIONS) {
         let agent_config = AgentConfig {
-            model: state.config.agent.default_model.clone(),
-            context_window: state.config.agent.context_window,
-            reserve_tokens: state.config.agent.reserve_tokens,
+            model: config.agent.default_model.clone(),
+            context_window: config.agent.context_window,
+            reserve_tokens: config.agent.reserve_tokens,
         };
 
-        let mut agent = Agent::new(agent_config, &state.config, state.memory.clone()).await?;
+        let mut agent = Agent::new(agent_config, &config, state.memory.clone(), Some(state.config.clone())).await?;
 
         // Try to resume the session
         if agent.resume_session(&session_info.id).await.is_ok() {
@@ -313,13 +312,14 @@ async fn get_or_create_session(
     // Create new session
     let new_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+    let config = state.config.read().await.clone();
     let agent_config = AgentConfig {
-        model: state.config.agent.default_model.clone(),
-        context_window: state.config.agent.context_window,
-        reserve_tokens: state.config.agent.reserve_tokens,
+        model: config.agent.default_model.clone(),
+        context_window: config.agent.context_window,
+        reserve_tokens: config.agent.reserve_tokens,
     };
 
-    let mut agent = Agent::new(agent_config, &state.config, state.memory.clone())
+    let mut agent = Agent::new(agent_config, &config, state.memory.clone(), Some(state.config.clone()))
         .await
         .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -391,9 +391,10 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
         }
     }
 
+    let config = state.config.read().await;
     Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        model: state.config.agent.default_model.clone(),
+        model: config.agent.default_model.clone(),
         memory_chunks: state.memory.chunk_count().unwrap_or(0),
         active_sessions: count,
     })
@@ -415,10 +416,11 @@ async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateSessionRequest>,
 ) -> Response {
+    let default_model = state.config.read().await.agent.default_model.clone();
     match get_or_create_session(&state, request.session_id).await {
         Ok(session_id) => Json(SessionResponse {
             session_id,
-            model: state.config.agent.default_model.clone(),
+            model: default_model,
         })
         .into_response(),
         Err(e) => e.into_response(),
@@ -1103,27 +1105,39 @@ struct HeartbeatConfigInfo {
 }
 
 async fn get_config(State(state): State<Arc<AppState>>) -> Json<ConfigResponse> {
+    let config = state.config.read().await;
     Json(ConfigResponse {
         agent: AgentConfigInfo {
-            default_model: state.config.agent.default_model.clone(),
-            context_window: state.config.agent.context_window,
-            reserve_tokens: state.config.agent.reserve_tokens,
+            default_model: config.agent.default_model.clone(),
+            context_window: config.agent.context_window,
+            reserve_tokens: config.agent.reserve_tokens,
         },
         server: ServerConfigInfo {
-            port: state.config.server.port,
-            bind: state.config.server.bind.clone(),
+            port: config.server.port,
+            bind: config.server.bind.clone(),
         },
         memory: MemoryConfigInfo {
-            workspace: state.config.memory.workspace.clone(),
-            embedding_model: state.config.memory.embedding_model.clone(),
-            chunk_size: state.config.memory.chunk_size,
-            chunk_overlap: state.config.memory.chunk_overlap,
+            workspace: config.memory.workspace.clone(),
+            embedding_model: config.memory.embedding_model.clone(),
+            chunk_size: config.memory.chunk_size,
+            chunk_overlap: config.memory.chunk_overlap,
         },
         heartbeat: HeartbeatConfigInfo {
-            enabled: state.config.heartbeat.enabled,
-            interval: state.config.heartbeat.interval.clone(),
+            enabled: config.heartbeat.enabled,
+            interval: config.heartbeat.interval.clone(),
         },
     })
+}
+
+async fn reload_config(State(state): State<Arc<AppState>>) -> Response {
+    match reload_shared(&state.config).await {
+        Ok(()) => (StatusCode::OK, "Config reloaded").into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to reload config: {}", e),
+        )
+            .into_response(),
+    }
 }
 
 // Heartbeat status endpoint
@@ -1169,9 +1183,10 @@ async fn heartbeat_status(State(state): State<Arc<AppState>>) -> Json<HeartbeatS
         }
     });
 
+    let config = state.config.read().await;
     Json(HeartbeatStatusResponse {
-        enabled: state.config.heartbeat.enabled,
-        interval: state.config.heartbeat.interval.clone(),
+        enabled: config.heartbeat.enabled,
+        interval: config.heartbeat.interval.clone(),
         last_event,
     })
 }

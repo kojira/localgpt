@@ -169,6 +169,13 @@ pub const COMMANDS: &[SlashCommand] = &[
         interfaces: &[Interface::Cli, Interface::Telegram],
     },
     SlashCommand {
+        name: "reload-config",
+        description: "Reload configuration from disk (daemon only)",
+        aliases: &[],
+        usage: "",
+        interfaces: &[Interface::Cli, Interface::Telegram],
+    },
+    SlashCommand {
         name: "unpair",
         description: "Unpair Telegram account",
         aliases: &[],

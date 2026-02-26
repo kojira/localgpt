@@ -20,6 +20,7 @@ pub mod transcript;
 pub mod tts_cache;
 pub mod tts_pipeline;
 pub mod worker;
+pub mod profiling;
 #[cfg(test)]
 mod e2e_test;
 
@@ -136,6 +137,15 @@ impl VoiceManager {
 
         let context_window_ms = self.config.voice.pipeline.context_window_ms;
         let use_room = self.config.voice.pipeline.context_window_auto && context_window_ms > 0;
+        let _ = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open("/Users/kojira/.openclaw/workspace/projects/localgpt/.cursor/debug.log")
+            .and_then(|mut f| {
+                use std::io::Write;
+                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+                writeln!(f, r#"{{"id":"voice_start","timestamp":{},"location":"voice/mod.rs","message":"pipeline mode","data":{{"use_room":{},"context_window_ms":{}}},"hypothesisId":"A"}}"#, ts, use_room, context_window_ms)
+            });
         let (room_tx, room_rx) = if use_room {
             let (tx, rx) = mpsc::unbounded_channel::<RoomMessage>();
             (Some(tx), Some(rx))
@@ -159,6 +169,7 @@ impl VoiceManager {
                     tr_tx,
                     "LocalGPT".to_string(),
                     context_window_ms,
+                    profiling::VoiceProfilerWriter::open(),
                 )
                 .await;
             });

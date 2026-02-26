@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::agent::{Agent, AgentConfig, StreamEvent, extract_tool_detail};
 use crate::concurrency::TurnGate;
-use crate::config::Config;
+use crate::config::{reload_shared, Config, SharedConfig};
 use crate::memory::MemoryManager;
 
 /// Agent ID for Telegram sessions
@@ -45,6 +45,8 @@ struct SessionEntry {
 
 struct BotState {
     config: Config,
+    /// When running under daemon, used for /reload-config and Agent::new
+    shared_config: Option<SharedConfig>,
     sessions: Mutex<HashMap<i64, SessionEntry>>,
     memory: MemoryManager,
     turn_gate: TurnGate,
@@ -76,7 +78,11 @@ fn generate_pairing_code() -> String {
     format!("{:06}", rng.random_range(100000..999999u32))
 }
 
-pub async fn run_telegram_bot(config: &Config, turn_gate: TurnGate) -> Result<()> {
+pub async fn run_telegram_bot(
+    config: &Config,
+    shared_config: Option<SharedConfig>,
+    turn_gate: TurnGate,
+) -> Result<()> {
     let telegram_config = config
         .telegram
         .as_ref()
@@ -109,6 +115,7 @@ pub async fn run_telegram_bot(config: &Config, turn_gate: TurnGate) -> Result<()
 
     let state = Arc::new(BotState {
         config: config.clone(),
+        shared_config,
         sessions: Mutex::new(HashMap::new()),
         memory,
         turn_gate,
@@ -419,6 +426,29 @@ async fn handle_command(
                 }
             }
         }
+        "/reload-config" => {
+            match state.shared_config.as_ref() {
+                Some(shared) => match reload_shared(shared).await {
+                    Ok(()) => {
+                        bot.send_message(chat_id, "設定を再読み込みしました。").await?;
+                    }
+                    Err(e) => {
+                        bot.send_message(
+                            chat_id,
+                            format!("設定の再読み込みに失敗しました: {}", e),
+                        )
+                        .await?;
+                    }
+                }
+                None => {
+                    bot.send_message(
+                        chat_id,
+                        "Config reload is only available when running the daemon.",
+                    )
+                    .await?;
+                }
+            }
+        }
         "/unpair" => {
             *state.paired_user.lock().await = None;
             if let Ok(path) = pairing_file_path() {
@@ -645,7 +675,14 @@ async fn handle_chat(
             reserve_tokens: state.config.agent.reserve_tokens,
         };
 
-        match Agent::new(agent_config, &state.config, state.memory.clone()).await {
+        match Agent::new(
+            agent_config,
+            &state.config,
+            state.memory.clone(),
+            state.shared_config.clone(),
+        )
+        .await
+        {
             Ok(mut agent) => {
                 if let Err(err) = agent.new_session().await {
                     error!("Failed to create session: {}", err);
