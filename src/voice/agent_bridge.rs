@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use regex::Regex;
 use tracing::{info, warn};
 
 use crate::agent::{Agent, AgentConfig as AgentCfg};
@@ -257,6 +258,15 @@ async fn stream_agent_response(
 
     let agent = agents.get_mut(&key).unwrap();
 
+    // Build plugin-tag regex from config tags.
+    let tag_names: Vec<String> = config.tags.keys().map(|k| k.to_uppercase()).collect();
+    let plugin_tag_re: Option<Regex> = if tag_names.is_empty() {
+        None
+    } else {
+        let pattern = format!(r"\[({}):([^\]]*)\]", tag_names.join("|"));
+        Regex::new(&pattern).ok()
+    };
+
     let mut stream = match agent.chat_stream(text).await {
         Ok(s) => s,
         Err(e) => {
@@ -265,14 +275,17 @@ async fn stream_agent_response(
         }
     };
 
-    let mut full_response = String::new();
+    let mut full_response = String::new(); // filtered (TTS/history)
+    let mut raw_response = String::new();  // unfiltered (plugin tag execution)
     loop {
         match stream.next().await {
             Some(Ok(chunk)) => {
                 if !chunk.delta.is_empty() {
+                    // Accumulate raw delta for plugin tag execution.
+                    raw_response.push_str(&chunk.delta);
                     // Strip Claude CLI metadata lines (e.g. "[Model: ... | Tools: N]")
                     // before forwarding to TTS / callers.
-                    let filtered = strip_emoji(&strip_cli_metadata(&chunk.delta));
+                    let filtered = strip_emoji(&strip_cli_metadata(&strip_plugin_tags(&chunk.delta, plugin_tag_re.as_ref())));
                     full_response.push_str(&filtered);
                     // Only forward if there is actual content remaining.
                     if !filtered.is_empty() {
@@ -293,9 +306,28 @@ async fn stream_agent_response(
             None => break,
         }
     }
+    // Execute plugin tags from the raw (unfiltered) response (fire-and-forget).
+    if !config.tags.is_empty() {
+        crate::plugin_tags::execute_command_tags(&raw_response, &config.tags).await;
+    }
     // Commit assistant turn to session history so the next turn has context.
     agent.finish_chat_stream(&full_response);
     // token_tx drops here → receiver gets None → stream ends.
+}
+
+/// Strip plugin tag lines from text before TTS.
+/// Lines containing [TAGNAME:content] (TAGNAME from config tags) are removed entirely.
+pub fn strip_plugin_tags(text: &str, tag_re: Option<&Regex>) -> String {
+    let Some(re) = tag_re else {
+        return text.to_string();
+    };
+    let mut out: Vec<&str> = Vec::new();
+    for line in text.split('\n') {
+        if !re.is_match(line) {
+            out.push(line);
+        }
+    }
+    out.join("\n")
 }
 
 /// Strip Claude CLI metadata header lines from a streaming text chunk.
@@ -709,5 +741,44 @@ mod tests {
     #[test]
     fn strip_emoji_handles_empty() {
         assert_eq!(strip_emoji(""), "");
+    }
+
+    // ── strip_plugin_tags ────────────────────────────────────────────
+    #[test]
+    fn strip_plugin_tags_removes_react_line() {
+        let re = Regex::new(r"\[(NOSTARO|CMD):([^\]]*)\]").unwrap();
+        let input = "[NOSTARO:react:abc123:X]\nHello world";
+        let result = strip_plugin_tags(input, Some(&re));
+        assert!(!result.contains("[NOSTARO:"), "tag line should be removed");
+        assert!(result.contains("Hello world"), "normal text must survive");
+    }
+    #[test]
+    fn strip_plugin_tags_removes_entire_line_with_text() {
+        let re = Regex::new(r"\[(NOSTARO|CMD):([^\]]*)\]").unwrap();
+        let input = "[NOSTARO:post:hello] extra text\nKeep this";
+        let result = strip_plugin_tags(input, Some(&re));
+        assert!(!result.contains("extra text"), "line with tag should be fully removed");
+        assert!(result.contains("Keep this"), "untagged lines must survive");
+    }
+    #[test]
+    fn strip_plugin_tags_no_tags_unchanged() {
+        let re = Regex::new(r"\[(NOSTARO|CMD):([^\]]*)\]").unwrap();
+        let input = "normal text [laugh] keep this";
+        let result = strip_plugin_tags(input, Some(&re));
+        assert_eq!(result, input, "text without plugin tags must not be altered");
+    }
+    #[test]
+    fn strip_plugin_tags_none_re_unchanged() {
+        let input = "[NOSTARO:react:abc:X]\nsome text";
+        let result = strip_plugin_tags(input, None);
+        assert_eq!(result, input, "with no regex, text must be returned unchanged");
+    }
+    #[test]
+    fn strip_plugin_tags_cmd_tag_removed() {
+        let re = Regex::new(r"\[(NOSTARO|CMD):([^\]]*)\]").unwrap();
+        let input = "[CMD:ls:/tmp]\nNormal response";
+        let result = strip_plugin_tags(input, Some(&re));
+        assert!(!result.contains("[CMD:"), "CMD tag line should be removed");
+        assert!(result.contains("Normal response"));
     }
 }

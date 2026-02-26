@@ -9,6 +9,7 @@
 
 pub mod agent;
 pub mod commands;
+pub mod plugin_tags;
 pub mod concurrency;
 pub mod config;
 #[cfg(feature = "desktop")]
