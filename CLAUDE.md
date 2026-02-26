@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Build
 cargo build              # Debug build
 cargo build --release    # Release build (~27MB binary)
+cargo build --release --features voice   # voice機能有効（現在はdefault）
 
 # Run
 cargo run -- <subcommand>   # Run with arguments

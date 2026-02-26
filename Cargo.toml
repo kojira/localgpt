@@ -15,7 +15,7 @@ keywords = ["ai", "assistant", "llm", "memory", "local"]
 categories = ["command-line-utilities", "text-processing"]
 
 [features]
-default = ["desktop"]
+default = ["desktop", "voice"]
 # Desktop GUI (eframe/egui). Disable for headless/server/Docker builds.
 desktop = ["eframe"]
 # GGUF embedding model support via llama.cpp (requires C++ compiler)

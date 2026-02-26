@@ -272,7 +272,7 @@ async fn stream_agent_response(
                 if !chunk.delta.is_empty() {
                     // Strip Claude CLI metadata lines (e.g. "[Model: ... | Tools: N]")
                     // before forwarding to TTS / callers.
-                    let filtered = strip_cli_metadata(&chunk.delta);
+                    let filtered = strip_emoji(&strip_cli_metadata(&chunk.delta));
                     full_response.push_str(&filtered);
                     // Only forward if there is actual content remaining.
                     if !filtered.is_empty() {
@@ -319,6 +319,15 @@ pub fn strip_cli_metadata(text: &str) -> String {
         }
     }
     out.join("\n")
+}
+
+/// Remove emoji characters from text before TTS.
+///
+/// Uses [`is_emoji_char`] to identify emoji codepoints and filters them out,
+/// ensuring the TTS engine does not emit noise when the LLM response contains
+/// decorative emoji inline (e.g. "今日はいい天気です ☀️").
+pub fn strip_emoji(text: &str) -> String {
+    text.chars().filter(|c| !is_emoji_char(*c)).collect()
 }
 
 /// Returns `true` if `c` is an emoji or emoji-related character.
@@ -679,5 +688,26 @@ mod tests {
         let handle = tokio::spawn(async move { b.generate(1, "test").await });
         let result = handle.await.unwrap().unwrap();
         assert_eq!(result, "echo: test");
+    }
+
+    // ── strip_emoji ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn strip_emoji_removes_inline_emoji() {
+        let input = "今日はいい天気です ☀️ 楽しいね 🎉";
+        let result = strip_emoji(input);
+        assert!(!result.contains('🎉'), "party emoji should be removed");
+        assert!(result.contains("今日はいい天気です"), "Japanese text must survive");
+    }
+
+    #[test]
+    fn strip_emoji_preserves_ascii_and_japanese() {
+        let input = "Hello world! こんにちは";
+        assert_eq!(strip_emoji(input), input, "plain text must not be altered");
+    }
+
+    #[test]
+    fn strip_emoji_handles_empty() {
+        assert_eq!(strip_emoji(""), "");
     }
 }
