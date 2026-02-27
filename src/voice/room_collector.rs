@@ -15,6 +15,7 @@ use tokio::time::Instant;
 use tracing::{debug, error, info};
 
 use super::agent_bridge::{AgentBridge, RoomMessage};
+use super::debug::DebugState;
 use super::profiling::{ProfileSession, VoiceProfilerWriter};
 use super::splitter::SentenceSplitter;
 use super::transcript::TranscriptEntry;
@@ -34,6 +35,7 @@ pub async fn run_room_collector(
     bot_name: String,
     context_window_ms: u64,
     profiler_writer: VoiceProfilerWriter,
+    debug_state: Option<std::sync::Arc<DebugState>>,
 ) {
     let context_window = Duration::from_millis(context_window_ms);
     let mut buffer: Vec<RoomMessage> = Vec::new();
@@ -65,6 +67,12 @@ pub async fn run_room_collector(
                             continue;
                         }
                         info!(room_id, user_id, %user_name, %text, "Room collector: buffered utterance");
+                        // Debug: post STT recognition result to Discord if debug mode is on.
+                        if let Some(ref ds) = debug_state {
+                            let msg = format!("🎤 [{}]: 「{}」", user_name, text.trim());
+                            let ds_clone = ds.clone();
+                            tokio::spawn(async move { ds_clone.post_if_enabled(&msg).await });
+                        }
                         send_transcript(&transcript_tx, TranscriptEntry::UserSpeech {
                             user_id,
                             user_name: user_name.clone(),
@@ -84,6 +92,7 @@ pub async fn run_room_collector(
                                 &transcript_tx,
                                 &bot_name,
                                 &profiler_writer,
+                                debug_state.clone(),
                             ).await {
                                 tracing::error!(room_id, "Room flush error: {}", e);
                             }
@@ -107,6 +116,7 @@ pub async fn run_room_collector(
                     &transcript_tx,
                     &bot_name,
                     &profiler_writer,
+                    debug_state.clone(),
                 ).await {
                     tracing::error!(room_id, "Room flush error: {}", e);
                 }
@@ -124,6 +134,7 @@ async fn flush(
     transcript_tx: &Option<mpsc::UnboundedSender<TranscriptEntry>>,
     bot_name: &str,
     profiler_writer: &VoiceProfilerWriter,
+    debug_state: Option<std::sync::Arc<DebugState>>,
 ) -> Result<()> {
     let batch = std::mem::take(buffer);
     if batch.is_empty() {
@@ -236,6 +247,15 @@ async fn flush(
         played_text.push_str(&seg.text);
         if audio_output_tx.send((room_id, playback)).is_err() {
             tracing::warn!(room_id, "Room collector: audio output channel closed during flush");
+        }
+    }
+
+    // Debug: post LLM response to Discord if debug mode is on.
+    if let Some(ref ds) = debug_state {
+        if !played_text.is_empty() {
+            let msg = format!("🤖 {}: 「{}」", bot_name, played_text.trim());
+            let ds_clone = ds.clone();
+            tokio::spawn(async move { ds_clone.post_if_enabled(&msg).await });
         }
     }
 

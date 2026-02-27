@@ -922,6 +922,78 @@ impl Tool for WebFetchTool {
     }
 }
 
+// ─── Debug Mode Tools ────────────────────────────────────────────────────────
+
+/// Tool that enables debug mode (voice pipeline: post STT/LLM text to Discord).
+pub struct DebugOnTool {
+    flag: Arc<tokio::sync::Mutex<bool>>,
+}
+
+impl DebugOnTool {
+    pub fn new(flag: Arc<tokio::sync::Mutex<bool>>) -> Self {
+        Self { flag }
+    }
+}
+
+#[async_trait]
+impl Tool for DebugOnTool {
+    fn name(&self) -> &str {
+        "debug_on"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "debug_on".to_string(),
+            description: "デバッグモードをONにする。STT認識結果とLLM応答テキストをDiscordのテキストチャンネルに投稿するようになる。".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+
+    async fn execute(&self, _arguments: &str) -> Result<String> {
+        *self.flag.lock().await = true;
+        Ok("デバッグモードをONにしました。STT/LLM テキストをDiscordに投稿します。".to_string())
+    }
+}
+
+/// Tool that disables debug mode.
+pub struct DebugOffTool {
+    flag: Arc<tokio::sync::Mutex<bool>>,
+}
+
+impl DebugOffTool {
+    pub fn new(flag: Arc<tokio::sync::Mutex<bool>>) -> Self {
+        Self { flag }
+    }
+}
+
+#[async_trait]
+impl Tool for DebugOffTool {
+    fn name(&self) -> &str {
+        "debug_off"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "debug_off".to_string(),
+            description: "デバッグモードをOFFにする。STT認識結果とLLM応答テキストのDiscord投稿を停止する。".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+
+    async fn execute(&self, _arguments: &str) -> Result<String> {
+        *self.flag.lock().await = false;
+        Ok("デバッグモードをOFFにしました。".to_string())
+    }
+}
+
 /// Extract relevant detail from tool arguments for display.
 /// Returns a human-readable summary of the key argument (file path, command, query, URL).
 pub fn extract_tool_detail(tool_name: &str, arguments: &str) -> Option<String> {

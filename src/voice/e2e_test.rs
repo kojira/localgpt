@@ -208,6 +208,7 @@ mod tests {
             300,
             0,
             None,
+            None,
         );
         (worker, in_tx, out_rx, is_playing, cancel)
     }
@@ -244,6 +245,7 @@ mod tests {
             cancel.clone(),
             300,
             0,
+            None,
             None,
         );
         (worker, in_tx, out_rx, transcript_rx, is_playing, cancel)
@@ -328,7 +330,7 @@ mod tests {
             })),
             Arc::new(MockTtsProvider::silent()),
             Arc::new(MockAgentBridge::new()),
-            in_rx, out_tx, None, is_playing, cancel, 1, 0, None,
+            in_rx, out_tx, None, is_playing, cancel, 1, 0, None, None,
         );
         let _ = in_tx; // keep channel open
 
@@ -588,7 +590,7 @@ mod tests {
 
         let mut dispatcher = Dispatcher::new(
             stt, tts, bridge, out_tx, None,
-            "Bot".to_string(), 300, true, Some(0), None,
+            "Bot".to_string(), 300, true, Some(0), None, None,
         );
 
         // Spawn worker.
@@ -616,7 +618,7 @@ mod tests {
 
         let mut dispatcher = Dispatcher::new(
             stt, tts, bridge, out_tx, None,
-            "Bot".to_string(), 300, true, Some(0), None,
+            "Bot".to_string(), 300, true, Some(0), None, None,
         );
 
         // Two users speak at the same time.
@@ -651,7 +653,7 @@ mod tests {
 
         let mut dispatcher = Dispatcher::new(
             stt, tts, bridge, out_tx, Some(transcript_tx),
-            "Bot".to_string(), 300, true, Some(0), None,
+            "Bot".to_string(), 300, true, Some(0), None, None,
         );
 
         dispatcher.dispatch(1, "Alice".to_string(), trigger_audio());

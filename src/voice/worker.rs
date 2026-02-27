@@ -38,6 +38,7 @@ use tracing::{debug, error, info};
 use super::profiling::{ProfileSession, VoiceProfilerWriter};
 
 use super::agent_bridge::{AgentBridge, RoomMessage};
+use super::debug::DebugState;
 use super::provider::{SttEvent, SttProvider, TtsProvider};
 use super::splitter::SentenceSplitter;
 use super::transcript::TranscriptEntry;
@@ -67,6 +68,8 @@ pub struct PipelineWorker {
     /// When Some, STT finals are sent here for room batching instead of per-user LLM+TTS.
     room_tx: Option<mpsc::UnboundedSender<RoomMessage>>,
     profiler_writer: VoiceProfilerWriter,
+    /// Optional debug state for posting STT/LLM text to Discord when debug mode is on.
+    debug_state: Option<std::sync::Arc<DebugState>>,
     /// Timestamp of the first audible PCM chunk (RMS > AUDIBLE_RMS_THRESHOLD) in the current
     /// utterance.  Used as the `speech_start_at` anchor for `ProfileSession` so that
     /// `elapsed_from_speech_start` reflects actual voice onset rather than the (potentially
@@ -102,6 +105,7 @@ impl PipelineWorker {
         idle_timeout_sec: u64,
         stt_buffer_samples: usize,
         room_tx: Option<mpsc::UnboundedSender<RoomMessage>>,
+        debug_state: Option<std::sync::Arc<DebugState>>,
     ) -> Self {
         Self {
             user_id,
@@ -136,6 +140,7 @@ impl PipelineWorker {
             profiler_writer: VoiceProfilerWriter::null(),
             first_audible_at: None,
             pcm_session_start_at: None,
+            debug_state,
         }
     }
 
@@ -361,6 +366,13 @@ impl PipelineWorker {
                             current_speech_start = None;
                             prof_session.log_stt_final(text);
 
+                            // Debug: post STT recognition result to Discord (1:1 mode).
+                            if let Some(ref ds) = self.debug_state {
+                                let stt_msg = format!("🎤 [{}]: 「{}」", self.user_name, text.trim());
+                                let ds_clone = ds.clone();
+                                tokio::spawn(async move { ds_clone.post_if_enabled(&stt_msg).await });
+                            }
+
                             // Process text through agent + TTS with cancellation support.
                             self.process_text(text, prof_session).await?;
                         }
@@ -539,6 +551,15 @@ impl PipelineWorker {
             }
         }
 
+        // Debug: post LLM response to Discord (1:1 mode).
+        if let Some(ref ds) = self.debug_state {
+            if !played_text.is_empty() {
+                let llm_msg = format!("🤖 {}: 「{}」", self.bot_name, played_text.trim());
+                let ds_clone = ds.clone();
+                tokio::spawn(async move { ds_clone.post_if_enabled(&llm_msg).await });
+            }
+        }
+
         // Log full response transcript.
         self.send_transcript(TranscriptEntry::BotResponse {
             bot_name: self.bot_name.clone(),
@@ -658,6 +679,7 @@ mod tests {
             idle_timeout_sec,
             0,
             None,
+            None,
         );
         (worker, is_playing, cancel)
     }
@@ -689,6 +711,7 @@ mod tests {
             cancel,
             DEFAULT_IDLE_TIMEOUT_SEC,
             0,
+            None,
             None,
         );
         assert_eq!(w.user_id, 42);

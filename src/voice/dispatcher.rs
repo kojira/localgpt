@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 use super::agent_bridge::{AgentBridge, RoomMessage};
+use super::debug::DebugState;
 use super::provider::{SttProvider, TtsProvider};
 use super::transcript::TranscriptEntry;
 use super::worker::PipelineWorker;
@@ -45,6 +46,8 @@ pub struct Dispatcher {
     stt_buffer_samples: Option<usize>,
     /// When Some, workers send STT finals here for room-level batching (one LLM call per batch).
     room_tx: Option<mpsc::UnboundedSender<RoomMessage>>,
+    /// Optional debug state for posting STT/LLM text to Discord when debug mode is on.
+    debug_state: Option<Arc<DebugState>>,
 }
 
 impl Dispatcher {
@@ -59,6 +62,7 @@ impl Dispatcher {
         interrupt_enabled: bool,
         stt_buffer_samples: Option<usize>,
         room_tx: Option<mpsc::UnboundedSender<RoomMessage>>,
+        debug_state: Option<Arc<DebugState>>,
     ) -> Self {
         Self {
             workers: HashMap::new(),
@@ -72,6 +76,7 @@ impl Dispatcher {
             interrupt_enabled,
             stt_buffer_samples,
             room_tx,
+            debug_state,
         }
     }
 
@@ -99,6 +104,7 @@ impl Dispatcher {
                 .stt_buffer_samples
                 .unwrap_or(super::worker::STT_BUFFER_SAMPLES);
             let room_tx = self.room_tx.clone();
+            let debug_state = self.debug_state.clone();
             tokio::spawn(async move {
                 let mut worker = PipelineWorker::new(
                     user_id,
@@ -115,6 +121,7 @@ impl Dispatcher {
                     idle_timeout_sec,
                     stt_buffer_samples,
                     room_tx,
+                    debug_state,
                 );
                 match worker.run().await {
                     Ok(reason) => {
@@ -204,7 +211,7 @@ mod tests {
         let bridge: Arc<dyn AgentBridge> = Arc::new(MockAgentBridge::new());
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         (
-            Dispatcher::new(stt, tts, bridge, out_tx, None, "Bot".to_string(), 300, true, Some(0), None),
+            Dispatcher::new(stt, tts, bridge, out_tx, None, "Bot".to_string(), 300, true, Some(0), None, None),
             out_rx,
         )
     }
@@ -265,6 +272,7 @@ mod tests {
             300,
             true,
             Some(0),
+            None,
             None,
         );
 
@@ -358,6 +366,7 @@ mod tests {
                 300,
                 false,
                 Some(0),
+                None,
                 None,
             );
 

@@ -885,14 +885,36 @@ impl DiscordBot {
                                         vm.init_gateway(bot_user_id);
                                         info!("Voice gateway initialized for bot user {}", bot_user_id);
 
+                                        // Build debug state if owner_id is configured.
+                                        // Channel priority: debug_channel_id (explicit) → VC channel ID (Text in Voice).
+                                        // Discord GUILD_VOICE channels (type 2) support text messages via
+                                        // POST /channels/{id}/messages — the "Text in Voice" feature (added 2022).
+                                        let debug_state = self.config.voice.as_ref().and_then(|vc| {
+                                            vc.owner_id.as_ref()?; // require owner_id to be set
+                                            let channel_id = vc.debug_channel_id.clone().or_else(|| {
+                                                // Fallback: use the VC channel ID from the first auto_join entry.
+                                                vc.discord.auto_join.first().map(|aj| aj.channel_id.clone())
+                                            })?;
+                                            let ds = Arc::new(crate::voice::DebugState::new(
+                                                self.http.clone(),
+                                                self.discord_config.token.clone(),
+                                                channel_id,
+                                            ));
+                                            info!("Debug mode enabled for voice pipeline (owner_id={})", vc.owner_id.as_deref().unwrap_or(""));
+                                            Some(ds)
+                                        });
+
                                         // Start the voice pipeline (with transcript_tx when transcript enabled, real LLM bridge)
+                                        let owner_id = self.config.voice.as_ref().and_then(|vc| vc.owner_id.clone());
                                         let agent_bridge: Option<Arc<dyn crate::voice::agent_bridge::AgentBridge>> =
                                             Some(Arc::new(
                                                 crate::voice::agent_bridge::RealAgentBridge::new(
                                                     self.config.clone(),
+                                                    debug_state.clone(),
+                                                    owner_id,
                                                 ),
                                             ));
-                                        if let Err(e) = vm.start_pipeline(transcript_tx, agent_bridge).await {
+                                        if let Err(e) = vm.start_pipeline(transcript_tx, agent_bridge, debug_state).await {
                                             error!("Failed to start voice pipeline: {}", e);
                                         } else {
                                             info!("Voice pipeline started");

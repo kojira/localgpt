@@ -27,7 +27,7 @@ pub use system_prompt::{
     HEARTBEAT_OK_TOKEN, SILENT_REPLY_TOKEN, build_heartbeat_prompt, is_heartbeat_ok,
     is_silent_reply,
 };
-pub use tools::{Tool, ToolResult, extract_tool_detail};
+pub use tools::{DebugOffTool, DebugOnTool, Tool, ToolResult, extract_tool_detail};
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -263,6 +263,14 @@ impl Agent {
 
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    /// Append extra tools to the agent's tool list.
+    ///
+    /// Used by the voice bridge to inject debug-mode tools (e.g. `debug_on`, `debug_off`)
+    /// for owner users without touching the default tool set.
+    pub fn extend_tools(&mut self, extra: Vec<Box<dyn Tool>>) {
+        self.tools.extend(extra);
     }
 
     /// Check if a tool requires user approval before execution

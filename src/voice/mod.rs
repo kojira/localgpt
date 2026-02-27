@@ -7,6 +7,7 @@ pub mod agent_bridge;
 pub mod audio;
 pub mod config;
 pub mod context_window;
+pub mod debug;
 pub mod dispatcher;
 pub mod gateway;
 pub mod lrs;
@@ -25,6 +26,7 @@ pub mod profiling;
 mod e2e_test;
 
 pub use config::VoiceManagerConfig;
+pub use debug::DebugState;
 pub use gateway::{VoiceGateway, VoiceServerData, VoiceStateData};
 pub use receiver::AudioChunk;
 
@@ -111,10 +113,12 @@ impl VoiceManager {
     /// When `transcript_tx` is `Some`, workers will send transcript entries (user speech / bot response)
     /// so the caller can post them to a Discord text channel or log.
     /// When `agent_bridge` is `Some`, that bridge is used for LLM; otherwise a mock echo bridge is used.
+    /// When `debug_state` is `Some`, debug mode support is enabled (STT/LLM text posting to Discord).
     pub async fn start_pipeline(
         &mut self,
         transcript_tx: Option<mpsc::UnboundedSender<TranscriptEntry>>,
         agent_bridge: Option<Arc<dyn AgentBridge>>,
+        debug_state: Option<Arc<DebugState>>,
     ) -> Result<()> {
         let audio_rx = self
             .audio_rx
@@ -163,6 +167,7 @@ impl VoiceManager {
             let tts = tts_provider.clone();
             let out_tx = audio_output_tx.clone();
             let tr_tx = transcript_tx.clone();
+            let ds = debug_state.clone();
             tokio::spawn(async move {
                 room_collector::run_room_collector(
                     room_id,
@@ -174,6 +179,7 @@ impl VoiceManager {
                     "LocalGPT".to_string(),
                     context_window_ms,
                     profiling::VoiceProfilerWriter::open(),
+                    ds,
                 )
                 .await;
             });
@@ -192,6 +198,7 @@ impl VoiceManager {
             self.config.voice.pipeline.interrupt_enabled,
             None,
             room_tx,
+            debug_state,
         );
         info!("Dispatcher created");
 

@@ -94,6 +94,17 @@ pub struct VoiceConfig {
 
     #[serde(default)]
     pub transcript: VoiceTranscriptConfig,
+
+    /// Discord user ID of the owner who can enable/disable debug mode.
+    /// When set, only this user's utterances expose `debug_on`/`debug_off` tools.
+    #[serde(default)]
+    pub owner_id: Option<String>,
+
+    /// Text channel ID for debug messages (STT/LLM text).
+    /// If not set, falls back to the VC channel ID itself (Discord "Text in Voice" feature).
+    /// VoiceChannel (type 2) supports text messages via POST /channels/{id}/messages since 2022.
+    #[serde(default)]
+    pub debug_channel_id: Option<String>,
 }
 
 impl Default for VoiceConfig {
@@ -107,6 +118,8 @@ impl Default for VoiceConfig {
             agent: VoiceAgentConfig::default(),
             audio: VoiceAudioConfig::default(),
             transcript: VoiceTranscriptConfig::default(),
+            owner_id: None,
+            debug_channel_id: None,
         }
     }
 }

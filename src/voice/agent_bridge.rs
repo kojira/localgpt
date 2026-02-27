@@ -14,9 +14,10 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use regex::Regex;
 use tracing::{info, warn};
 
-use crate::agent::{Agent, AgentConfig as AgentCfg};
+use crate::agent::{Agent, AgentConfig as AgentCfg, DebugOffTool, DebugOnTool};
 use crate::config::Config;
 use crate::memory::MemoryManager;
+use super::debug::DebugState;
 
 /// One utterance in a room: (user_id, user_name, text, speech_start_at).
 ///
@@ -84,7 +85,11 @@ pub struct RealAgentBridge {
 impl RealAgentBridge {
     /// Create a bridge that uses the given config to build agents per user.
     /// Spawns a dedicated thread that owns the agent map and runs the runtime.
-    pub fn new(config: Config) -> Self {
+    ///
+    /// `debug_state`: if Some, enables debug mode support (STT/LLM posting to Discord).
+    /// `owner_id`: the Discord user_id string of the debug-mode owner; only their agent
+    ///             gets `debug_on`/`debug_off` tools in 1:1 mode.
+    pub fn new(config: Config, debug_state: Option<std::sync::Arc<DebugState>>, owner_id: Option<String>) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Runtime::new() {
@@ -94,7 +99,7 @@ impl RealAgentBridge {
                     return;
                 }
             };
-            rt.block_on(worker_loop(&config, &mut rx));
+            rt.block_on(worker_loop(&config, &mut rx, debug_state, owner_id.as_deref()));
         });
         Self { tx }
     }
@@ -110,19 +115,21 @@ enum AgentKey {
 async fn worker_loop(
     config: &Config,
     rx: &mut mpsc::UnboundedReceiver<(u64, AgentRequest)>,
+    debug_state: Option<std::sync::Arc<DebugState>>,
+    owner_id: Option<&str>,
 ) {
     let mut agents: HashMap<AgentKey, Agent> = HashMap::new();
     while let Some((key_id, req)) = rx.recv().await {
         match req {
             AgentRequest::Generate(text, reply) => {
                 let result =
-                    get_or_create_then_chat(&mut agents, AgentKey::User(key_id), &text, config).await;
+                    get_or_create_then_chat(&mut agents, AgentKey::User(key_id), &text, config, debug_state.as_deref(), owner_id).await;
                 let _ = reply.send(result);
             }
             AgentRequest::GenerateStream(text, token_tx) => {
                 // Drain the LLM stream and forward each token via token_tx.
                 // token_tx is dropped at the end so the receiver sees end-of-stream.
-                stream_agent_response(&mut agents, AgentKey::User(key_id), &text, config, token_tx).await;
+                stream_agent_response(&mut agents, AgentKey::User(key_id), &text, config, token_tx, debug_state.as_deref(), owner_id).await;
             }
             AgentRequest::Reset(reply) => {
                 agents.remove(&AgentKey::User(key_id));
@@ -131,7 +138,7 @@ async fn worker_loop(
             AgentRequest::GenerateRoomStream(room_id, messages, token_tx) => {
                 let key = AgentKey::Room(room_id);
                 let formatted = format_room_messages(&messages);
-                stream_agent_response(&mut agents, key, &formatted, config, token_tx).await;
+                stream_agent_response(&mut agents, key, &formatted, config, token_tx, debug_state.as_deref(), owner_id).await;
             }
             AgentRequest::GenerateRoom(room_id, messages, reply) => {
                 // #region agent log
@@ -153,7 +160,7 @@ async fn worker_loop(
                 }
                 // #endregion
                 let result =
-                    get_or_create_room_then_chat(&mut agents, room_id, &messages, config).await;
+                    get_or_create_room_then_chat(&mut agents, room_id, &messages, config, debug_state.as_deref(), owner_id).await;
                 // #region agent log
                 let is_ok = result.is_ok();
                 if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -181,15 +188,28 @@ async fn worker_loop(
     info!("RealAgentBridge worker loop ended");
 }
 
-async fn get_or_create_then_chat(
-    agents: &mut HashMap<AgentKey, Agent>,
-    key: AgentKey,
-    text: &str,
-    config: &Config,
-) -> Result<String> {
-    if let Some(agent) = agents.get_mut(&key) {
-        return agent.chat(text).await;
+/// Returns true if the agent for this key should get debug tools injected.
+fn should_add_debug_tools(key: AgentKey, debug_state: Option<&DebugState>, owner_id: Option<&str>) -> bool {
+    if debug_state.is_none() {
+        return false;
     }
+    match key {
+        // 1:1 mode: only add debug tools for the owner's agent.
+        AgentKey::User(user_id) => {
+            owner_id.map_or(false, |oid| oid == user_id.to_string())
+        }
+        // Room mode: always add debug tools (owner may be in the room).
+        AgentKey::Room(_) => true,
+    }
+}
+
+/// Create a new `Agent` for the given key, optionally with debug tools injected.
+async fn create_agent(
+    key: AgentKey,
+    config: &Config,
+    debug_state: Option<&DebugState>,
+    owner_id: Option<&str>,
+) -> Result<Agent> {
     let agent_id = match key {
         AgentKey::User(u) => format!("voice-{}", u),
         AgentKey::Room(r) => format!("voice-room-{}", r),
@@ -199,10 +219,36 @@ async fn get_or_create_then_chat(
         context_window: config.agent.context_window,
         reserve_tokens: config.agent.reserve_tokens,
     };
-    let memory =
-        MemoryManager::new_with_full_config(&config.memory, Some(config), &agent_id)?;
+    let memory = MemoryManager::new_with_full_config(&config.memory, Some(config), &agent_id)?;
     let mut agent = Agent::new(agent_config, config, memory, None).await?;
+
+    // Inject debug_on/debug_off tools if this agent should have them.
+    if should_add_debug_tools(key, debug_state, owner_id) {
+        if let Some(ds) = debug_state {
+            let flag = ds.enabled_flag();
+            agent.extend_tools(vec![
+                Box::new(DebugOnTool::new(flag.clone())),
+                Box::new(DebugOffTool::new(flag)),
+            ]);
+        }
+    }
+
     agent.new_session().await?;
+    Ok(agent)
+}
+
+async fn get_or_create_then_chat(
+    agents: &mut HashMap<AgentKey, Agent>,
+    key: AgentKey,
+    text: &str,
+    config: &Config,
+    debug_state: Option<&DebugState>,
+    owner_id: Option<&str>,
+) -> Result<String> {
+    if let Some(agent) = agents.get_mut(&key) {
+        return agent.chat(text).await;
+    }
+    let mut agent = create_agent(key, config, debug_state, owner_id).await?;
     let out = agent.chat(text).await;
     if out.is_ok() {
         agents.insert(key, agent);
@@ -223,36 +269,18 @@ async fn stream_agent_response(
     text: &str,
     config: &Config,
     token_tx: mpsc::UnboundedSender<Result<String>>,
+    debug_state: Option<&DebugState>,
+    owner_id: Option<&str>,
 ) {
     // Ensure agent exists.
     if !agents.contains_key(&key) {
-        let agent_id = match key {
-            AgentKey::User(u) => format!("voice-{}", u),
-            AgentKey::Room(r) => format!("voice-room-{}", r),
-        };
-        let agent_config = AgentCfg {
-            model: config.agent.default_model.clone(),
-            context_window: config.agent.context_window,
-            reserve_tokens: config.agent.reserve_tokens,
-        };
-        let memory = match MemoryManager::new_with_full_config(&config.memory, Some(config), &agent_id) {
-            Ok(m) => m,
-            Err(e) => {
-                let _ = token_tx.send(Err(e));
-                return;
-            }
-        };
-        let mut agent = match Agent::new(agent_config, config, memory, None).await {
+        let agent = match create_agent(key, config, debug_state, owner_id).await {
             Ok(a) => a,
             Err(e) => {
                 let _ = token_tx.send(Err(e));
                 return;
             }
         };
-        if let Err(e) = agent.new_session().await {
-            let _ = token_tx.send(Err(e));
-            return;
-        }
         agents.insert(key, agent);
     }
 
@@ -438,10 +466,12 @@ async fn get_or_create_room_then_chat(
     room_id: u64,
     messages: &[RoomMessage],
     config: &Config,
+    debug_state: Option<&DebugState>,
+    owner_id: Option<&str>,
 ) -> Result<String> {
     let key = AgentKey::Room(room_id);
     let formatted = format_room_messages(messages);
-    get_or_create_then_chat(agents, key, &formatted, config).await
+    get_or_create_then_chat(agents, key, &formatted, config, debug_state, owner_id).await
 }
 
 #[async_trait]

@@ -165,6 +165,16 @@ file = "~/.localgpt/logs/agent.log"
 # [voice]
 # enabled = true
 #
+# # Debug mode: when set, the specified owner can enable/disable debug logging via voice commands.
+# # Only the owner's agent gets `debug_on` / `debug_off` tools.
+# # owner_id = "390732846236434452"        # Discord user ID of the owner
+# #
+# # Debug post channel:
+# #   - If debug_channel_id is set: posts go there (explicit text channel).
+# #   - If not set: falls back to the VC channel ID (Discord "Text in Voice" feature —
+# #     GUILD_VOICE channels (type 2) support text messages via POST /channels/{id}/messages).
+# # debug_channel_id = "1234567890"        # Optional: override channel for debug posts
+#
 # [voice.discord]
 # # Auto-join voice channels on daemon start
 # [[voice.discord.auto_join]]
