@@ -38,6 +38,11 @@ impl SsrcUserMap {
         self.ssrc_to_user.get(&ssrc).map(|r| r.value().clone())
     }
 
+    /// Look up the SSRC for a user (reverse direction: user_id → SSRC).
+    pub fn get_ssrc_for_user(&self, user_id: u64) -> Option<u32> {
+        self.user_to_ssrc.get(&user_id).map(|r| *r.value())
+    }
+
     /// Remove a user (e.g. on voice-channel leave).
     pub fn remove_user(&self, user_id: u64) {
         if let Some((_, ssrc)) = self.user_to_ssrc.remove(&user_id) {

@@ -13,6 +13,7 @@ use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
+use std::collections::HashMap;
 use std::sync::{atomic::AtomicBool, atomic::AtomicU32, atomic::Ordering, Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -46,14 +47,16 @@ pub struct AudioChunk {
 struct InnerReceiver {
     /// Channel to send audio chunks to the dispatcher
     audio_tx: mpsc::UnboundedSender<AudioChunk>,
-    /// SSRC → (UserId, username) mapping, updated by SpeakingStateUpdate events
-    ssrc_map: SsrcUserMap,
+    /// SSRC → (UserId, username) mapping, updated by SpeakingStateUpdate events.
+    /// Shared as Arc so VoiceGateway can also update it (e.g. on VOICE_STATE_UPDATE).
+    ssrc_map: Arc<SsrcUserMap>,
     /// WAV writer for debug logging (16 kHz mono 16-bit PCM, resampled from 48 kHz)
     wav_writer: Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>,
     /// WAV writer for 48 kHz stereo debug logging
     wav_writer_48k_stereo: Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>,
-    /// Persistent resampler for 48 kHz → 16 kHz mono conversion
-    resampler: Mutex<Option<SincFixedIn<f32>>>,
+    /// Per-SSRC resamplers for 48 kHz → 16 kHz mono conversion.
+    /// Each speaker gets their own resampler to avoid state contamination between users.
+    resamplers: Mutex<HashMap<u32, SincFixedIn<f32>>>,
     /// Flag to track if we're currently recording (once per session)
     recording: AtomicBool,
     /// SSRC of the current speaker being recorded
@@ -80,15 +83,18 @@ pub struct VoiceReceiveHandler {
 }
 
 impl VoiceReceiveHandler {
-    /// Create a new receive handler.
-    pub fn new(audio_tx: mpsc::UnboundedSender<AudioChunk>) -> Self {
+    /// Create a new receive handler with a shared SSRC map.
+    ///
+    /// The `ssrc_map` is shared with the VoiceGateway so that gateway-level
+    /// events (e.g. VOICE_STATE_UPDATE for other users) can also update the mapping.
+    pub fn new(audio_tx: mpsc::UnboundedSender<AudioChunk>, ssrc_map: Arc<SsrcUserMap>) -> Self {
         Self {
             inner: Arc::new(InnerReceiver {
                 audio_tx,
-                ssrc_map: SsrcUserMap::new(),
+                ssrc_map,
                 wav_writer: Mutex::new(None),
                 wav_writer_48k_stereo: Mutex::new(None),
-                resampler: Mutex::new(None),
+                resamplers: Mutex::new(HashMap::new()),
                 recording: AtomicBool::new(false),
                 recording_ssrc: Mutex::new(None),
                 silent_tick_count: AtomicU32::new(0),
@@ -100,20 +106,40 @@ impl VoiceReceiveHandler {
 }
 
 impl InnerReceiver {
-    /// Get or initialize the resampler for 48 kHz → 16 kHz conversion.
-    fn get_or_init_resampler(&self) -> std::sync::MutexGuard<'_, Option<SincFixedIn<f32>>> {
-        let mut guard = self.resampler.lock().unwrap();
-        if guard.is_none() {
-            let params = SincInterpolationParameters {
-                sinc_len: 256,
-                f_cutoff: 0.95,
-                interpolation: SincInterpolationType::Linear,
-                oversampling_factor: 256,
-                window: WindowFunction::BlackmanHarris2,
-            };
-            *guard = Some(SincFixedIn::<f32>::new(16000.0 / 48000.0, 2.0, params, 960, 1).unwrap());
+    /// Create a new SincFixedIn resampler for 48 kHz → 16 kHz conversion.
+    fn make_resampler() -> SincFixedIn<f32> {
+        let params = SincInterpolationParameters {
+            sinc_len: 256,
+            f_cutoff: 0.95,
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: 256,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        SincFixedIn::<f32>::new(16000.0 / 48000.0, 2.0, params, 960, 1)
+            .expect("Failed to create resampler")
+    }
+
+    /// Resample mono 48 kHz PCM to 16 kHz using a per-SSRC resampler.
+    ///
+    /// Each SSRC (speaker) has its own resampler instance to prevent state
+    /// contamination when multiple users are speaking simultaneously.
+    fn process_with_resampler(&self, ssrc: u32, mono: Vec<f32>) -> Vec<f32> {
+        let mut resamplers = self.resamplers.lock().unwrap();
+        let resampler = resamplers.entry(ssrc).or_insert_with(Self::make_resampler);
+        let waves_in = vec![mono.clone()];
+        match resampler.process(&waves_in, None) {
+            Ok(mut result) => result.remove(0),
+            Err(e) => {
+                warn!(ssrc, "Resample failed: {}", e);
+                mono
+            }
         }
-        guard
+    }
+
+    /// Remove per-SSRC resampler state when a user disconnects.
+    fn remove_resampler(&self, ssrc: u32) {
+        let mut resamplers = self.resamplers.lock().unwrap();
+        resamplers.remove(&ssrc);
     }
 
     /// Initialize WAV writers for debug logging.
@@ -250,20 +276,11 @@ impl InnerReceiver {
             // Downmix stereo → mono (average L and R channels)
             let mono = stereo_to_mono(&pcm_f32);
 
-            // Resample mono from 48 kHz to 16 kHz
+            // Resample mono from 48 kHz to 16 kHz using per-SSRC resampler.
+            // Each SSRC has its own SincFixedIn instance to avoid state contamination
+            // between multiple simultaneous speakers.
             let rms_before = calculate_rms(&mono);
-            let mono_16k = {
-                let mut resampler_guard = self.get_or_init_resampler();
-                let resampler = resampler_guard.as_mut().unwrap();
-                let waves_in = vec![mono.clone()];
-                match resampler.process(&waves_in, None) {
-                    Ok(mut result) => result.remove(0),
-                    Err(e) => {
-                        warn!("Resample failed: {}", e);
-                        mono.clone()
-                    }
-                }
-            };
+            let mono_16k = self.process_with_resampler(ssrc, mono.clone());
 
             let rms = calculate_rms(&mono_16k);
 
@@ -421,12 +438,16 @@ impl InnerReceiver {
         }
     }
 
-    /// Handle a ClientDisconnect event: remove user from SSRC map.
+    /// Handle a ClientDisconnect event: remove user from SSRC map and clean up resampler.
     fn handle_client_disconnect(
         &self,
         disconnect: &songbird::model::payload::ClientDisconnect,
     ) {
         let uid = disconnect.user_id.0;
+        // Look up the SSRC before removing the user, so we can clean up the resampler
+        if let Some(ssrc) = self.ssrc_map.get_ssrc_for_user(uid) {
+            self.remove_resampler(ssrc);
+        }
         self.ssrc_map.remove_user(uid);
         info!(
             user_id = uid,
@@ -539,7 +560,8 @@ mod tests {
     #[test]
     fn voice_receive_handler_new() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let handler = VoiceReceiveHandler::new(tx);
+        let ssrc_map = Arc::new(SsrcUserMap::new());
+        let handler = VoiceReceiveHandler::new(tx, ssrc_map);
         // Verify construction succeeds
         let _ = handler;
     }
@@ -547,7 +569,8 @@ mod tests {
     #[test]
     fn voice_receive_handler_is_clone() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let handler = VoiceReceiveHandler::new(tx);
+        let ssrc_map = Arc::new(SsrcUserMap::new());
+        let handler = VoiceReceiveHandler::new(tx, ssrc_map);
         let _cloned = handler.clone();
         // Both share the same inner state (Arc)
     }

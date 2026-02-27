@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use super::receiver::{AudioChunk, VoiceReceiveHandler};
+use super::ssrc_map::SsrcUserMap;
 
 /// Probe that includes Ogg container support (for Ogg Opus from TTS API).
 /// Songbird's get_probe() only registers DCA; we need Ogg for format=opus.
@@ -129,6 +130,10 @@ pub struct VoiceGateway {
     calls: DashMap<u64, Arc<Mutex<Call>>>,
     /// Channel to send decoded audio chunks to the dispatcher
     audio_tx: mpsc::UnboundedSender<AudioChunk>,
+    /// Per-guild SSRC→UserId maps shared with VoiceReceiveHandlers.
+    /// Allows gateway-level events (e.g. VOICE_STATE_UPDATE for other users)
+    /// to update the mapping alongside songbird's SpeakingStateUpdate events.
+    ssrc_maps: DashMap<u64, Arc<SsrcUserMap>>,
 }
 
 impl VoiceGateway {
@@ -141,6 +146,7 @@ impl VoiceGateway {
             connection_states: DashMap::new(),
             calls: DashMap::new(),
             audio_tx,
+            ssrc_maps: DashMap::new(),
         }
     }
 
@@ -193,9 +199,10 @@ impl VoiceGateway {
         // Transition to Disconnected
         self.transition(guild_id, VcConnectionState::Disconnected)?;
 
-        // Clean up pending state
+        // Clean up pending state and SSRC map
         self.pending_voice_states.remove(&guild_id);
         self.pending_voice_servers.remove(&guild_id);
+        self.ssrc_maps.remove(&guild_id);
 
         info!(guild_id, "Left voice channel");
         Ok(())
@@ -203,11 +210,36 @@ impl VoiceGateway {
 
     /// Handle Voice State Update from Discord Gateway.
     ///
-    /// Stores the session_id. If a pending Voice Server Update is already
-    /// available for this guild, triggers connection immediately.
+    /// For the bot's own state: stores the session_id and triggers VC connection.
+    /// For other users: maintains the SSRC map (removes mapping on leave).
+    ///
+    /// Note: `ClientConnect` was removed in songbird 0.5+. The canonical way to
+    /// detect other users joining/leaving is via main-gateway VOICE_STATE_UPDATE.
     pub async fn handle_voice_state_update(&self, data: VoiceStateData) {
-        // Ignore updates for other users (we only care about our own bot)
+        // Handle non-bot users: update SSRC map on leave/join
         if data.user_id != self.bot_user_id {
+            if data.channel_id.is_none() {
+                // User left the VC — remove their SSRC mapping immediately.
+                // This is belt-and-suspenders alongside songbird's ClientDisconnect.
+                if let Some(ssrc_map) = self.ssrc_maps.get(&data.guild_id) {
+                    ssrc_map.remove_user(data.user_id);
+                    info!(
+                        guild_id = data.guild_id,
+                        user_id = data.user_id,
+                        "User left VC: SSRC mapping removed (VOICE_STATE_UPDATE)"
+                    );
+                }
+            } else {
+                // User joined or moved to a channel.
+                // We can't determine the new SSRC here — that comes from SpeakingStateUpdate.
+                // Just log for diagnostics.
+                info!(
+                    guild_id = data.guild_id,
+                    user_id = data.user_id,
+                    channel_id = ?data.channel_id,
+                    "User joined/moved VC (VOICE_STATE_UPDATE); SSRC will be mapped on SpeakingStateUpdate"
+                );
+            }
             return;
         }
 
@@ -328,6 +360,15 @@ impl VoiceGateway {
             user_id: UserId(user_nz),
         };
 
+        // Get or create the shared SSRC map for this guild.
+        // This map is shared between the VoiceReceiveHandler and the gateway,
+        // allowing both songbird events and main-gateway events to update mappings.
+        let ssrc_map = self
+            .ssrc_maps
+            .entry(guild_id)
+            .or_insert_with(|| Arc::new(SsrcUserMap::new()))
+            .clone();
+
         // Create or get the standalone Call for this guild
         let call_arc = self
             .calls
@@ -346,7 +387,9 @@ impl VoiceGateway {
                 // Register a single shared handler for all needed voice events.
                 // The handler is Clone (Arc-based) so all events share state
                 // (SSRC→UserId map, resampler, WAV writers, etc.).
-                let receiver = VoiceReceiveHandler::new(self.audio_tx.clone());
+                // The ssrc_map is shared with the gateway to allow cleanup from
+                // VOICE_STATE_UPDATE events as well as songbird events.
+                let receiver = VoiceReceiveHandler::new(self.audio_tx.clone(), ssrc_map.clone());
                 call.add_global_event(Event::Core(CoreEvent::VoiceTick), receiver.clone());
                 call.add_global_event(Event::Core(CoreEvent::SpeakingStateUpdate), receiver.clone());
                 call.add_global_event(Event::Core(CoreEvent::ClientDisconnect), receiver);
@@ -511,6 +554,7 @@ impl VoiceGateway {
         self.connection_states.clear();
         self.pending_voice_states.clear();
         self.pending_voice_servers.clear();
+        self.ssrc_maps.clear();
     }
 }
 
