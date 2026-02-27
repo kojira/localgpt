@@ -135,6 +135,10 @@ impl VoiceManager {
         // Create audio output channel for TTS playback (PCM or Opus)
         let (audio_output_tx, mut audio_output_rx) = mpsc::unbounded_channel::<(u64, PlaybackAudio)>();
 
+        // Interrupt channel: playback loop forwards barge-in signals (empty audio) to the
+        // dispatch loop, which owns the Dispatcher and can call handle_interrupt().
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<u64>();
+
         let context_window_ms = self.config.voice.pipeline.context_window_ms;
         let use_room = self.config.voice.pipeline.context_window_auto && context_window_ms > 0;
         let _ = std::fs::OpenOptions::new()
@@ -201,11 +205,15 @@ impl VoiceManager {
             .first()
             .and_then(|aj| aj.guild_id.parse::<u64>().ok());
         tokio::spawn(async move {
-            while let Some((_user_id, playback)) = audio_output_rx.recv().await {
+            while let Some((user_id, playback)) = audio_output_rx.recv().await {
                 if let (Some(gw), Some(gid)) = (&gateway_for_playback, playback_guild_id) {
                     match playback {
                         PlaybackAudio::Pcm(audio) => {
                             if audio.is_empty() {
+                                // Barge-in signal from worker: forward user_id to the dispatch
+                                // loop so it can call dispatcher.handle_interrupt(user_id).
+                                info!(user_id, "Barge-in signal received, forwarding to dispatcher");
+                                let _ = interrupt_tx.send(user_id);
                                 continue;
                             }
                             let n = audio.len();
@@ -217,6 +225,9 @@ impl VoiceManager {
                         }
                         PlaybackAudio::Opus(data) => {
                             if data.is_empty() {
+                                // Barge-in signal (Opus variant — forward same as Pcm).
+                                info!(user_id, "Barge-in signal (Opus) received, forwarding to dispatcher");
+                                let _ = interrupt_tx.send(user_id);
                                 continue;
                             }
                             let n = data.len();
@@ -237,29 +248,53 @@ impl VoiceManager {
         tokio::spawn(async move {
             let mut audio_rx = audio_rx;
             let mut dispatch_count: u64 = 0;
-            while let Some(chunk) = audio_rx.recv().await {
-                // Use the resolved user_id/user_name from the SSRC map
-                // (populated by SpeakingStateUpdate events in the receiver).
-                // Fall back to SSRC-based placeholder if not yet mapped.
-                let user_id = chunk.user_id.unwrap_or(chunk.ssrc as u64);
-                let user_name = chunk
-                    .user_name
-                    .unwrap_or_else(|| format!("user_{}", chunk.ssrc));
+            loop {
+                tokio::select! {
+                    biased;
 
-                // Diagnostic: log first 20 dispatches to confirm data flow
-                if dispatch_count < 20 {
-                    info!(
-                        user_id,
-                        user_name,
-                        ssrc = chunk.ssrc,
-                        samples = chunk.pcm.len(),
-                        dispatch_count,
-                        "[B] Dispatching audio to worker"
-                    );
+                    // Handle barge-in interrupts from the playback task with priority.
+                    interrupt_uid = interrupt_rx.recv() => {
+                        match interrupt_uid {
+                            Some(uid) => {
+                                info!(user_id = uid, "Barge-in detected, calling handle_interrupt");
+                                dispatcher.handle_interrupt(uid);
+                            }
+                            None => {
+                                // interrupt_tx dropped — playback task exited.
+                                break;
+                            }
+                        }
+                    }
+
+                    // Normal audio dispatch.
+                    chunk_opt = audio_rx.recv() => {
+                        let Some(chunk) = chunk_opt else {
+                            break;
+                        };
+                        // Use the resolved user_id/user_name from the SSRC map
+                        // (populated by SpeakingStateUpdate events in the receiver).
+                        // Fall back to SSRC-based placeholder if not yet mapped.
+                        let user_id = chunk.user_id.unwrap_or(chunk.ssrc as u64);
+                        let user_name = chunk
+                            .user_name
+                            .unwrap_or_else(|| format!("user_{}", chunk.ssrc));
+
+                        // Diagnostic: log first 20 dispatches to confirm data flow
+                        if dispatch_count < 20 {
+                            info!(
+                                user_id,
+                                user_name,
+                                ssrc = chunk.ssrc,
+                                samples = chunk.pcm.len(),
+                                dispatch_count,
+                                "[B] Dispatching audio to worker"
+                            );
+                        }
+                        dispatch_count += 1;
+
+                        dispatcher.dispatch(user_id, user_name, chunk.pcm);
+                    }
                 }
-                dispatch_count += 1;
-
-                dispatcher.dispatch(user_id, user_name, chunk.pcm);
             }
             info!("Audio dispatcher loop ended");
         });
