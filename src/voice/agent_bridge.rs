@@ -198,8 +198,8 @@ fn should_add_debug_tools(key: AgentKey, debug_state: Option<&DebugState>, owner
         AgentKey::User(user_id) => {
             owner_id.map_or(false, |oid| oid == user_id.to_string())
         }
-        // Room mode: always add debug tools (owner may be in the room).
-        AgentKey::Room(_) => true,
+        // Room mode: don't add debug tools (streaming path ignores tool calls).
+        AgentKey::Room(_) => false,
     }
 }
 
